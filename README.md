@@ -1,6 +1,6 @@
 # 🤖 ClinePass TG Bot
 
-> 当前版本 **0.0.4**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
+> 当前版本 **0.0.5**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
 
 把 Cline / ClinePass 账号的用量做成 Telegram 面板：一个用户可绑定多个 API Key，`/status` 一次看全部账号。
 
@@ -80,6 +80,10 @@ python bot.py
 
 > 别名里可以带空格：Bot 把**最后一个参数当 Key**，前面的都算别名，
 > 所以 `/addkey Codex 备用 sk_xxx` 存下来的别名就是 `Codex 备用`。
+>
+> **Key 没有长度上限**：`sk_` + 59 位、上百位都正常，只要求 ≥ 8 个字符且不含空格。
+> 从网页复制时容易夹带零宽字符（U+200B 之类）——肉眼一样但服务端只会回 401，
+> Bot 会自动清理，并在回复里加一句「已自动去掉不可见的字符」。
 
 ## 指令一览
 
@@ -216,7 +220,7 @@ Authorization: Bearer sk_xxx
 ├── .github/workflows/ci.yml  # CI：单测矩阵 → 构建镜像+冒烟 → 打标签时推 GHCR
 ├── bot.py                # Telegram 交互层：指令、鉴权、限流、错误兜底
 ├── core.py               # 核心逻辑：JSON 存储、API 客户端、面板渲染（无 PTB 依赖，可单测）
-├── tests/test_core.py    # 61 个单元测试，纯标准库
+├── tests/test_core.py    # 72 个单元测试，纯标准库
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -240,31 +244,49 @@ python3 -m unittest discover -s tests -t . -v
 
 | job | 内容 |
 | --- | --- |
-| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 61 个单元测试 |
+| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 72 个单元测试 |
 | `docker` | buildx 构建镜像（带 gha 缓存）→ 镜像内自检：能导入、非 root(10001)、命名卷可写配置、缺 Token 时退出码为 1 |
 | `publish` | 仅在 `main` 分支或 `v*` 标签上触发，推送到 GHCR（`ghcr.io/mbaigc/clinepass-tg-bot`） |
 
 发布一个新版本：
 
 ```bash
-# 1) 改 core.py 里的 __version__（例如 0.0.4），提交并推送
-vim core.py && git commit -am "release: 0.0.4" && git push
+# 1) 改 core.py 里的 __version__（例如 0.0.5），提交并推送
+vim core.py && git commit -am "release: 0.0.5" && git push
 
 # 2) 打标签并推送，CI 会自动构建并推送镜像
-git tag v0.0.4 && git push origin v0.0.4
+git tag v0.0.5 && git push origin v0.0.5
 ```
 
-镜像标签规则：`v0.0.4` → `0.0.4`、`0.0`；`main` 分支 → `main` 与 `latest`。镜像公开后可以直接部署：
+镜像标签规则：`v0.0.5` → `0.0.5`、`0.0`；`main` 分支 → `main` 与 `latest`。镜像公开后可以直接部署：
 
 ```bash
 docker run -d --name clinepass_tg_bot --restart unless-stopped \
   -e TELEGRAM_BOT_TOKEN=xxx \
   -v clinepass-data:/app/data \
-  ghcr.io/mbaigc/clinepass-tg-bot:0.0.4
+  ghcr.io/mbaigc/clinepass-tg-bot:0.0.5
 ```
 
 > 上面用的是**命名卷**，Docker 会把镜像里 `/app/data` 的属主（uid 10001）带过来，开箱可写。
 > 如果你改成挂载宿主机目录（`-v ./data:/app/data`），必须先把目录交给 uid 10001，否则会报权限错误——见「故障排查」。
+
+## 日志与脱敏
+
+| 内容 | 说明 |
+| --- | --- |
+| 记录什么 | 每次 `/addkey`、`/delkey`、`/clear` 的别名与结果；每条收到的更新（**只记命令名**，不记正文） |
+| 不记什么 | API Key 全文、Telegram Token 全文；超过 16 字符的参数一律显示为 `<N字符>` |
+| 兜底脱敏 | 日志出口的过滤器会把 `bot<TOKEN>`、`sk_<KEY>` 替换掉，异常 traceback 和 `sys.excepthook` 也走同一条路 |
+| 噪音 | `httpx`（每个 getUpdates 一行）默认降到 WARNING，`LOG_LEVEL=DEBUG` 才打开 |
+
+排查「发了指令没有任何反馈」时，第一件事是看日志里有没有这一行：
+
+```
+收到更新：update_id=123 消息=Message 指令=/addkey chat=42(private) user=42
+```
+
+- **没有这行** → 更新压根没到 Bot：多半是斜杠打成了全角 `／`（Telegram 不当命令）、在群里且 Bot 开了隐私模式、或者有另一个实例/webhook 抢走了 updates。
+- **有这行但没有回复** → 往下看同一条 update_id 附近的 WARNING/ERROR，0.0.5 起每条失败路径都会留下原因。
 
 ## 故障排查
 
@@ -275,6 +297,8 @@ docker run -d --name clinepass_tg_bot --restart unless-stopped \
 | `❌ 配置存储不可用 … 权限不足`（0.0.2 起的不崩版本） | 同上，日志里的提示就是修复命令 |
 | `❌ 配置存储不可用 … 是一个目录` | 宿主机上把不存在的 `config.json` **文件**挂进了容器；改成挂载目录 |
 | `/addkey` 后 `/status` 仍说没有 Key | 先发 `/id`（0.0.4+）看存储是否可写；多半是「文件可读、目录不可写」，见下方排查 |
+| 发指令完全没反应 | 先看日志有没有 `收到更新：…`；没有就是更新没到 Bot（全角斜杠 `／`、群组隐私模式、另一个实例抢 updates） |
+| 日志里出现 `bot<TOKEN>` / `sk_<KEY>` | 这是脱敏后的样子，属正常；真 Token 不会进日志 |
 | `📊 额度接口不可用：接口不存在（404）` | 默认路径已对准官方接口；若你改过 `CLINEPASS_USAGE_PATH`，检查拼写 |
 | `📊 额度接口不可用：API Key 无效（401）` | 该 Key 已失效，重新 `/addkey` |
 | 面板只发出了一部分 | 已按 `MESSAGE_LIMIT` 自动分片，属正常 |
@@ -299,7 +323,7 @@ docker compose up -d
 ```bash
 docker compose down
 docker run --rm --user root -v clinepass-data:/app/data \
-  ghcr.io/mbaigc/clinepass-tg-bot:0.0.4 chown -R 10001:10001 /app/data
+  ghcr.io/mbaigc/clinepass-tg-bot:0.0.5 chown -R 10001:10001 /app/data
 docker compose up -d
 ```
 
@@ -348,6 +372,7 @@ docker compose logs --tail 100 | grep -iE "addkey|permission|traceback|conflict"
 
 | 版本 | 说明 |
 | --- | --- |
+| **0.0.5** | 日志改造：所有输出走兜底脱敏（Token → `bot<TOKEN>`、Key → `sk_<KEY>`，连 traceback 与 `sys.excepthook` 都覆盖），httpx 噪音降到 WARNING；新增 group -1 的「收到更新」日志（只记命令名，不记正文）；全角斜杠/打错指令名会明确回一句而不是沉默；API Key 自动清理零宽字符 |
 | **0.0.4** | 加诊断：`/id` 显示版本/容器名/配置文件/存储可写性/已绑定数量；启动时做写入探针；`/addkey`、`/delkey`、`/clear` 每次都有 INFO 日志（Key 绝不入日志）；未捕获异常会回一条带异常名的提示 |
 | **0.0.3** | `/addkey` 约定「最后一个参数是 Key，其余拼成别名」，带空格的别名（`Codex 备用`）不再是坑；别名规则与报错文案写清楚（`Cline-01` 一直合法） |
 | **0.0.2** | 修复：挂载目录不可写时 `tempfile.mkstemp` 抛出的 `PermissionError` 会漏出，导致进程崩在启动阶段；现在统一转成带修复指引的 `ConfigError`，Bot 降级运行并在日志/聊天里说明原因 |

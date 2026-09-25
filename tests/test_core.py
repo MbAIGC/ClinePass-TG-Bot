@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -545,6 +546,84 @@ class TestSelfCheck(unittest.TestCase):
         self.assertEqual(self.store.add(1, "a", "sk_123456789"), 1)
         self.assertEqual(self.store.add(1, "b", "sk_123456789"), 2)
         self.assertEqual(self.store.add(1, "a", "sk_987654321"), 2)
+
+
+# ==================== API Key 清洗 ====================
+class TestNormalizeApiKey(unittest.TestCase):
+    def test_long_key_is_fine(self):
+        """`sk_` + 59 位很正常，长度不设上限。"""
+        key = "sk_" + "a" * 59
+        self.assertEqual(core.normalize_api_key(key), (key, False))
+
+    def test_even_longer_key_is_fine(self):
+        key = "sk_" + "9" * 200
+        cleaned, changed = core.normalize_api_key(key)
+        self.assertEqual(cleaned, key)
+        self.assertFalse(changed)
+
+    def test_zero_width_chars_are_removed(self):
+        cleaned, changed = core.normalize_api_key("sk_abc\u200bdef\ufeffghi")
+        self.assertEqual(cleaned, "sk_abcdefghi")
+        self.assertTrue(changed)
+
+    def test_surrounding_whitespace_is_trimmed_without_flag(self):
+        """首尾空白本来就会被 strip，不算"清理掉了不可见字符"。"""
+        cleaned, changed = core.normalize_api_key("  sk_abcdefghijk  ")
+        self.assertEqual(cleaned, "sk_abcdefghijk")
+        self.assertFalse(changed)
+
+    def test_empty_input(self):
+        self.assertEqual(core.normalize_api_key(""), ("", False))
+
+
+# ==================== 日志脱敏 ====================
+class TestRedaction(unittest.TestCase):
+    def test_telegram_token_in_url_is_redacted(self):
+        text = "HTTP Request: POST https://api.telegram.org/bot8123456789:AAHsecretsecretsecret123/getUpdates"
+        out = core.redact(text)
+        self.assertNotIn("AAHsecretsecretsecret123", out)
+        self.assertIn("bot<TOKEN>", out)
+
+    def test_api_key_is_redacted(self):
+        out = core.redact("已保存 sk_05b0abcdef123456 成功")
+        self.assertNotIn("05b0abcdef123456", out)
+        self.assertIn("sk_<KEY>", out)
+
+    def test_plain_text_is_untouched(self):
+        self.assertEqual(core.redact("普通日志 123"), "普通日志 123")
+        self.assertEqual(core.redact(""), "")
+
+    def test_bare_token_in_exception_message_is_redacted(self):
+        """PTB 的 InvalidToken 会把 Token 原样写进异常消息里。"""
+        out = core.redact("The token `8999999999:AAFaketokenfortesting1234567890` was rejected")
+        self.assertNotIn("AAFaketokenfortesting1234567890", out)
+        self.assertIn("bot<TOKEN>", out)
+
+    def test_filter_redacts_traceback_too(self):
+        try:
+            raise RuntimeError("The token `8999999999:AAFaketokenfortesting1234567890` was rejected")
+        except RuntimeError:
+            exc_info = sys.exc_info()
+        record = logging.LogRecord("t", logging.ERROR, __file__, 1, "boom", (), exc_info)
+        core.RedactingFilter().filter(record)
+        text = logging.Formatter().format(record)
+        self.assertNotIn("AAFaketokenfortesting1234567890", text)
+        self.assertIn("bot<TOKEN>", text)
+
+    def test_filter_rewrites_the_record(self):
+        record = logging.LogRecord(
+            "httpx",
+            logging.INFO,
+            __file__,
+            1,
+            "url=%s",
+            ("https://api.telegram.org/bot123456789:AAHsecretsecretsecret123/x",),
+            None,
+        )
+        self.assertTrue(core.RedactingFilter().filter(record))
+        message = record.getMessage()
+        self.assertIn("bot<TOKEN>", message)
+        self.assertNotIn("AAHsecretsecretsecret123", message)
 
 
 # ==================== 版本 ====================

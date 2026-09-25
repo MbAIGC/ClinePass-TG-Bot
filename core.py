@@ -28,7 +28,63 @@ import requests
 log = logging.getLogger("clinepass.core")
 
 # 版本号（单一来源：bot 启动日志、/help、面板标题都取这里）
-__version__ = "0.0.4"
+__version__ = "0.0.5"
+
+#: 日志里必须抹掉的两个东西：Telegram Bot Token（藏在 httpx 的 URL 里、也藏在
+#: PTB 异常消息里）和 ClinePass API Key
+_SECRET_PATTERNS = (
+    # 带 bot 前缀的 URL 形态，以及异常消息里裸着的 123456789:AAF... 形态
+    (re.compile(r"(?:bot)?\d{5,}:[A-Za-z0-9_\-]{20,}"), "bot<TOKEN>"),
+    (re.compile(r"sk_[A-Za-z0-9_\-]{8,}"), "sk_<KEY>"),
+)
+
+
+def redact(text: str) -> str:
+    """把 Token / API Key 从任何准备写进日志的文本里抹掉。
+
+    httpx 在 INFO 级别会打印完整 URL，而 Telegram 的 Token 就长在 URL 里
+    （`https://api.telegram.org/bot<token>/getUpdates`），所以光靠"别打日志"
+    不够，得在出口处兜底。
+    """
+    if not text:
+        return text
+    out = str(text)
+    for pattern, replacement in _SECRET_PATTERNS:
+        out = pattern.sub(replacement, out)
+    return out
+
+
+class RedactingFilter(logging.Filter):
+    """日志出口的兜底脱敏：不管哪个库想打什么，都先过一遍 redact()。
+
+    除了消息正文，还要处理 traceback —— PTB 抛 InvalidToken 时会把 Token
+    原样写进异常消息里（`The token \\`123:AAF...\\` was rejected`）。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # 格式化失败就别动它，交给 Formatter 去报错
+            message = None
+        if message is not None:
+            cleaned = redact(message)
+            if cleaned != message:
+                record.msg = cleaned
+                record.args = ()
+        if record.exc_text:
+            record.exc_text = redact(record.exc_text)
+        elif record.exc_info:
+            try:
+                text = logging.Formatter().formatException(record.exc_info)
+            except Exception:
+                return True
+            cleaned = redact(text)
+            if cleaned != text:
+                record.exc_text = cleaned
+                record.exc_info = None
+        if record.stack_info:
+            record.stack_info = redact(record.stack_info)
+        return True
 
 # ==================== 常量 ====================
 DEFAULT_API_BASE = "https://api.cline.bot"
@@ -368,6 +424,27 @@ def sanitize_alias(raw: str) -> Optional[str]:
     if not ALIAS_RE.match(alias):
         return None
     return alias
+
+
+#: 复制粘贴最常见的"看不见的字符"：零宽空格/连接符、词连接符、BOM
+#: （普通空白如 \u00a0、\u3000 已经被 str.strip() 处理掉了）
+_INVISIBLE_CHARS = "\u200b\u200c\u200d\u2060\ufeff"
+
+
+def normalize_api_key(raw: str) -> tuple[str, bool]:
+    """清洗 API Key，返回 (清理后的 key, 是否真的清理过)。
+
+    Cline 的 Key 形如 `sk_` + 一串字符，**长度不设上限**（`sk_` 加 59 位很正常）。
+    真正会让人抓狂的是从网页复制时夹带的零宽字符：肉眼一模一样，
+    但请求头里多了一个 U+200B，服务端只会回 401。
+    """
+    text = (raw or "").strip()
+    cleaned = text
+    for ch in _INVISIBLE_CHARS:
+        cleaned = cleaned.replace(ch, "")
+    cleaned = "".join(c for c in cleaned if c.isprintable())
+    cleaned = cleaned.strip()
+    return cleaned, cleaned != text
 
 
 def split_alias_and_key(args: Sequence[str]) -> tuple[Optional[str], str]:

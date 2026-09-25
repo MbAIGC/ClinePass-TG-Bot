@@ -14,11 +14,19 @@ import logging
 import os
 import socket
 import sys
+import traceback
 
 from telegram import BotCommand, Update
 from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    TypeHandler,
+    filters,
+)
 
 from core import (
     ConfigError,
@@ -26,10 +34,13 @@ from core import (
     Cooldown,
     ClinePassClient,
     KeyLimitError,
+    RedactingFilter,
     Settings,
     __version__,
     esc,
     mask_key,
+    normalize_api_key,
+    redact,
     render_panel,
     split_alias_and_key,
     split_message,
@@ -56,6 +67,24 @@ def setup_logging() -> None:
         level=getattr(logging, level, logging.INFO),
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
+    # 出口兜底脱敏：httpx 会把 https://api.telegram.org/bot<token>/getUpdates
+    # 整条 URL 打进日志，PTB 的异常消息里也会带明文 Token。
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(RedactingFilter())
+    # 这些库在 INFO 级别只剩噪音（每个 getUpdates 一条），降到 WARNING
+    if getattr(logging, level, logging.INFO) > logging.DEBUG:
+        for noisy in ("httpx", "httpcore", "telegram", "telegram.ext"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def install_excepthook() -> None:
+    """最后一道防线：未捕获异常的 traceback 直接打到 stderr，绕过 logging 的过滤器。"""
+
+    def hook(exc_type: type[BaseException], exc: BaseException, tb: object) -> None:
+        text = "".join(traceback.format_exception(exc_type, exc, tb))  # type: ignore[arg-type]
+        logging.getLogger("clinepass.fatal").critical("未捕获异常，进程退出：\n%s", redact(text))
+
+    sys.excepthook = hook
 
 
 class BotContext:
@@ -225,6 +254,7 @@ async def addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     args = context.args or []
     log.info("收到 /addkey：user=%s，%s", user_id, _safe_args(args))
     alias, api_key = split_alias_and_key(args)
+    api_key, key_cleaned = normalize_api_key(api_key)
     if not api_key:
         log.warning("addkey 参数不足：user=%s，%s", user_id, _safe_args(args))
         await say(
@@ -245,8 +275,13 @@ async def addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
     if len(api_key) < 8 or any(ch.isspace() for ch in api_key):
-        log.warning("addkey 的 Key 看起来不合法：user=%s，长度=%d", user_id, len(api_key))
-        await say("⚠️ API Key 看起来不合法（长度需 ≥ 8 且不含空白字符）。")
+        log.warning(
+            "addkey 的 Key 看起来不合法：user=%s，长度=%d，清理过=%s", user_id, len(api_key), key_cleaned
+        )
+        await say(
+            "⚠️ API Key 看起来不合法：长度需 ≥ 8，且不含空格或换行。\n"
+            "（从网页复制时容易带上不可见字符，Bot 已经自动清理过一次）"
+        )
         return
 
     try:
@@ -261,8 +296,10 @@ async def addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await say("❌ 保存失败，Key <b>没有</b>被记录。\n" f"原因：<code>{esc(str(exc)[:300])}</code>")
         return
 
-    log.info("已保存 Key：user=%s，别名=%r，该用户现有 %s 个", user_id, alias, total)
+    log.info("已保存 Key：user=%s，别名=%r，长度=%d，该用户现有 %s 个", user_id, alias, len(api_key), total)
     note = "（含 Key 的消息已撤回）" if deleted else "（⚠️ 未能撤回原消息，建议自行删除）"
+    if key_cleaned:
+        note += "\n🧹 已自动去掉 Key 里夹带的不可见字符"
     await say(
         f"✅ 已保存 Key\n📌 别名：<code>{esc(alias)}</code>\n"
         f"🔐 Key：<code>{esc(mask_key(api_key))}</code>\n{note}"
@@ -357,17 +394,84 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("处理更新时发生未捕获异常", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
-        name = type(context.error).__name__ if context.error else "Unknown"
-        try:
-            await update.effective_message.reply_text(
-                f"😵 处理时出错了（<code>{esc(name)}</code>）。\n"
-                "如果这是 /addkey 报的，多半是配置存储写不进去——先用 /id 看一眼存储状态，"
-                "再把 <code>docker logs</code> 里的 traceback 发给管理员。",
-                parse_mode=ParseMode.HTML,
-            )
-        except TelegramError:
-            pass
+    if not isinstance(update, Update):
+        return
+    # 用 send_message 而不是 reply_text：/addkey 会先删掉原消息，
+    # 对着已删除的消息 reply 会直接失败，于是出错也变成了"毫无反馈"。
+    chat = update.effective_chat
+    if chat is None:
+        return
+    name = type(context.error).__name__ if context.error else "Unknown"
+    try:
+        await context.bot.send_message(
+            chat.id,
+            f"😵 处理时出错了（<code>{esc(name)}</code>）。\n"
+            "如果这是 /addkey 报的，多半是配置存储写不进去——先发 /id 看一眼存储状态，"
+            "再把 <code>docker logs</code> 里的 traceback 发给管理员。",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as exc:
+        log.error("连出错提示都发不出去：%s", exc)
+
+
+def _command_name(message: object) -> str:
+    """取出命令名用于日志。取不到就描述消息类型——**绝不返回正文**（可能含 Key）。"""
+    text = (getattr(message, "text", None) or "").strip()
+    if text.startswith("/") and len(text) > 1:
+        return text.split(maxsplit=1)[0].split("@", 1)[0]
+    entities = getattr(message, "entities", None) or []
+    if entities:
+        return f"<{entities[0].type}>"
+    return "(非命令消息)"
+
+
+async def log_incoming(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """group=-1：只记录「这条更新我到底收到没有」，不拦截后续处理。
+
+    排查「发了指令毫无反馈」时这一行就是关键证据：日志里没有它，
+    说明更新压根没到 Bot（全角斜杠、群组隐私模式、另一个实例或 webhook 抢走了）。
+    """
+    if not isinstance(update, Update):
+        log.info("收到更新：%s", type(update).__name__)
+        return
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.effective_message
+    log.info(
+        "收到更新：update_id=%s 消息=%s 指令=%s chat=%s(%s) user=%s",
+        update.update_id,
+        type(message).__name__ if message is not None else type(update).__name__,
+        _command_name(message) if message is not None else "-",
+        chat.id if chat else "-",
+        chat.type if chat else "-",
+        user.id if user else "-",
+    )
+
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """看起来像指令却没被任何 handler 认领 —— 必须给反馈，不能静默。
+
+    最常见的是全角斜杠：`／addkey` 在 Telegram 眼里只是普通消息，不会触发命令，
+    用户看到的就是"毫无反馈"。
+    """
+    message = update.effective_message
+    if message is None or update.effective_chat is None:
+        return
+    text = (message.text or "").strip()
+    log.warning(
+        "没能识别的指令：chat=%s user=%s 首字符=%r 长度=%d",
+        update.effective_chat.id,
+        update.effective_user.id if update.effective_user else "-",
+        text[:1],
+        len(text),
+    )
+    hint = ""
+    if text[:1] in ("／", "＼"):
+        hint = "看起来斜杠打成了全角 <code>／</code>，Telegram 只认英文 <code>/</code>。\n"
+    await message.reply_text(
+        "🤔 没识别出这个指令。\n" + hint + "常用：<code>/status</code>、<code>/addkey</code>、<code>/help</code>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def post_init(application: Application) -> None:
@@ -389,6 +493,9 @@ def build_application(settings: Settings, token: str) -> Application:
     application = Application.builder().token(token).post_init(post_init).build()
     application.bot_data["ctx"] = ctx
 
+    # group=-1：只记录收到了什么（block=False，不会拦住下面的指令处理）
+    application.add_handler(TypeHandler(Update, log_incoming, block=False), group=-1)
+
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("id", id_command))
@@ -397,12 +504,19 @@ def build_application(settings: Settings, token: str) -> Application:
     application.add_handler(CommandHandler("delkey", delkey_command))
     application.add_handler(CommandHandler("keys", keys_command))
     application.add_handler(CommandHandler("clear", clear_command))
+
+    # 同一个 group 里注册在最后：只有前面没有任何 CommandHandler 认领时才会轮到它，
+    # 于是「全角斜杠」「指令名打错」这类沉默都会变成一句明确的回复。
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(r"^\s*[/／]"), unknown_command)
+    )
     application.add_error_handler(on_error)
     return application
 
 
 def main() -> int:
     setup_logging()
+    install_excepthook()
     settings = Settings.from_env()
 
     store = ConfigStore(settings.config_file, settings.max_keys_per_user)
@@ -437,7 +551,14 @@ def main() -> int:
     )
 
     application = build_application(settings, token)
-    application.run_polling(drop_pending_updates=False)
+    try:
+        application.run_polling(drop_pending_updates=False)
+    except TelegramError as exc:
+        # 常见于 Token 写错/失效；PTB 的异常消息里会带明文 Token，这里必须脱敏
+        log.critical("Telegram 交互失败，进程退出：%s", redact(str(exc)))
+        return 1
+    except KeyboardInterrupt:  # pragma: no cover
+        log.info("收到 Ctrl-C，退出。")
     return 0
 
 
