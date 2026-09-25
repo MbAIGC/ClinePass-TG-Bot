@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,7 +23,11 @@ from core import (  # noqa: E402
     Cooldown,
     KeyLimitError,
     Settings,
+    describe_reset,
+    humanize_delta,
     mask_key,
+    parse_limits_list,
+    parse_timestamp,
     parse_usage,
     progress_bar,
     render_panel,
@@ -32,6 +37,18 @@ from core import (  # noqa: E402
     Snapshot,
     Window,
 )
+
+# 真实接口（2026-09 实测）的原样返回，用于回归测试
+REAL_LIMITS_PAYLOAD = {
+    "data": {
+        "limits": [
+            {"type": "five_hour", "percentUsed": 2, "resetsAt": "2026-09-25T14:32:27.073666206Z"},
+            {"type": "weekly", "percentUsed": 57, "resetsAt": "2026-09-30T12:08:27.075836336Z"},
+            {"type": "monthly", "percentUsed": 28, "resetsAt": "2026-10-23T12:08:27.07803017Z"},
+        ]
+    },
+    "success": True,
+}
 
 
 # ==================== 假 HTTP ====================
@@ -120,6 +137,38 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(cd.hit(1, now=106.0), 0.0)
         self.assertEqual(cd.hit(2, now=106.0), 0.0)  # 不同用户互不影响
         self.assertEqual(Cooldown(0).hit(1), 0.0)
+
+    def test_parse_timestamp(self):
+        # 官方返回纳秒精度 + Z，Python 3.11 的 fromisoformat 吃不下，必须规范化
+        self.assertEqual(
+            parse_timestamp("2026-09-25T14:32:27.073666206Z"),
+            datetime(2026, 9, 25, 14, 32, 27, 73666, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            parse_timestamp("2026-09-25T14:32:27Z"),
+            datetime(2026, 9, 25, 14, 32, 27, tzinfo=timezone.utc),
+        )
+        self.assertEqual(parse_timestamp("2026-09-25T14:32:27+08:00").utcoffset(), timedelta(hours=8))
+        self.assertEqual(parse_timestamp("2026-09-25 14:32:27").tzinfo, timezone.utc)
+        self.assertIsNone(parse_timestamp("not a time"))
+        self.assertIsNone(parse_timestamp(""))
+        self.assertIsNone(parse_timestamp(None))
+
+    def test_humanize_delta(self):
+        self.assertEqual(humanize_delta(-1), "已到重置时间")
+        self.assertEqual(humanize_delta(30), "不到 1 分钟")
+        self.assertEqual(humanize_delta(600), "10 分钟")
+        self.assertEqual(humanize_delta(3600 * 2 + 60 * 5), "2 小时 5 分")
+        self.assertEqual(humanize_delta(3600 * 24 * 3), "3 天")
+
+    def test_describe_reset(self):
+        now = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        window = Window("w", 10, reset_dt=datetime(2026, 9, 25, 14, 0, tzinfo=timezone.utc))
+        text = describe_reset(window, now)
+        self.assertIn("还有 2 小时", text)
+        self.assertRegex(text, r"^\d{2}-\d{2} \d{2}:\d{2}（还有 2 小时）$")
+        self.assertEqual(describe_reset(Window("w", 10, reset="周一 08:00"), now), "周一 08:00")
+        self.assertIsNone(describe_reset(Window("w", 10), now))
 
 
 # ==================== 配置存储 ====================
@@ -230,6 +279,67 @@ class TestParseUsage(unittest.TestCase):
         self.assertEqual([w.label for w in windows], ["5 小时额度", "本月额度"])
 
 
+# ==================== 官方额度接口 ====================
+class TestOfficialLimits(unittest.TestCase):
+    def test_real_payload(self):
+        windows = parse_usage(REAL_LIMITS_PAYLOAD)
+        self.assertIsNotNone(windows)
+        assert windows is not None
+        self.assertEqual([w.label for w in windows], ["5 小时额度", "本周额度", "本月额度"])
+        self.assertEqual([w.percent for w in windows], [2.0, 57.0, 28.0])
+        self.assertEqual([w.remaining_percent for w in windows], [98.0, 43.0, 72.0])
+        self.assertIsNotNone(windows[0].reset_dt)
+
+    def test_limits_without_envelope(self):
+        windows = parse_limits_list(
+            {"limits": [{"type": "weekly", "percentUsed": 10, "resetsAt": "2026-09-30T12:08:27Z"}]}
+        )
+        assert windows is not None
+        self.assertEqual(windows[0].label, "本周额度")
+        self.assertEqual(windows[0].percent, 10.0)
+
+    def test_type_aliases(self):
+        # 社区实现里出现过 '5-hour' 与线上 'five_hour' 不一致的问题，这里两种都要认
+        for raw in ("five_hour", "5-hour", "5_hour", "5h", "FIVE_HOUR"):
+            windows = parse_usage({"data": {"limits": [{"type": raw, "percentUsed": 7}]}})
+            assert windows is not None, raw
+            self.assertEqual(windows[0].label, "5 小时额度", raw)
+
+    def test_unknown_type_is_kept(self):
+        windows = parse_usage(
+            {"data": {"limits": [{"type": "daily", "percentUsed": 12}, {"type": "weekly", "percentUsed": 30}]}}
+        )
+        assert windows is not None
+        self.assertEqual([w.label for w in windows], ["本周额度", "daily"])
+
+    def test_malformed_entries_skipped(self):
+        self.assertIsNone(parse_usage({"data": {"limits": []}}))
+        self.assertIsNone(parse_usage({"data": {"limits": ["nope", {"type": ""}]}}))
+        self.assertIsNone(parse_limits_list({"data": {}}))
+
+    def test_warning_thresholds(self):
+        self.assertEqual(Window("w", 79.9).warning, "")
+        self.assertEqual(Window("w", 80).warning, "⚠️")
+        self.assertEqual(Window("w", 95).warning, "⛔️")
+        self.assertEqual(Window("w", None).warning, "")
+
+    def test_rendered_panel_shows_quota_and_countdown(self):
+        snapshot = Snapshot(
+            alias="主账号", key_mask="sk_7…aaaa", windows=parse_usage(REAL_LIMITS_PAYLOAD)
+        )
+        text = render_snapshot(snapshot, now=datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc))
+        self.assertIn("剩余 98%", text)
+        self.assertIn("剩余 43%", text)
+        self.assertIn("重置：", text)
+        self.assertIn("还有", text)
+        self.assertNotIn("⚠️", text)  # 2% / 57% / 28% 都不触发告警
+        self.assertNotIn("⛔️", text)
+
+    def test_badges_appear_when_hot(self):
+        self.assertIn("⚠️", render_snapshot(Snapshot("a", "k", windows=[Window("本周额度", 80.0)])))
+        self.assertIn("⛔️", render_snapshot(Snapshot("a", "k", windows=[Window("本周额度", 96.0)])))
+
+
 # ==================== API 客户端 ====================
 class TestClient(unittest.TestCase):
     def setUp(self):
@@ -255,15 +365,13 @@ class TestClient(unittest.TestCase):
                         },
                     },
                 ),
-                "/api/v1/user/usage": FakeResponse(
-                    200, {"success": True, "data": {"h5": {"percent": 63, "remaining_str": "1h 52m"}}}
-                ),
+                "/api/v1/users/me/plan/usage-limits": FakeResponse(200, REAL_LIMITS_PAYLOAD),
             }
         )
         snapshot = ClinePassClient(self.settings, session=session).fetch_snapshot_sync("主账号", "sk_test123456")
         self.assertEqual(snapshot.account["email"], "a@b.c")
         self.assertEqual(snapshot.plan["displayName"], "Cline Pass (Monthly)")
-        self.assertEqual(snapshot.windows[0].percent, 63.0)
+        self.assertEqual([w.percent for w in snapshot.windows], [2.0, 57.0, 28.0])
         self.assertEqual(snapshot.warnings, [])
 
     def test_invalid_key_short_circuits(self):
@@ -282,6 +390,7 @@ class TestClient(unittest.TestCase):
             }
         )
         snapshot = ClinePassClient(self.settings, session=session).fetch_snapshot_sync("x", "sk_test123456")
+        self.assertIn("/api/v1/users/me/plan/usage-limits", session.calls)  # 默认打官方额度接口
         self.assertFalse(snapshot.has_usage)
         self.assertTrue(any("404" in w for w in snapshot.warnings))
         text = render_snapshot(snapshot)
@@ -293,7 +402,10 @@ class TestClient(unittest.TestCase):
             {
                 "/api/v1/users/me": FakeResponse(200, {"data": {"email": "a@b.c"}}),
                 "/api/v1/users/me/plan": FakeResponse(200, {"data": {}}),
-                "/api/v1/user/usage": [FakeResponse(503, {"error": "boom"}), FakeResponse(200, {"data": {"h5": {"percent": 7}}})],
+                "/api/v1/users/me/plan/usage-limits": [
+                    FakeResponse(503, {"error": "boom"}),
+                    FakeResponse(200, REAL_LIMITS_PAYLOAD),
+                ],
             }
         )
         settings = settings_for(self.tmp.name, http_retries=1)
@@ -303,7 +415,7 @@ class TestClient(unittest.TestCase):
             snapshot = ClinePassClient(settings, session=session).fetch_snapshot_sync("x", "sk_test123456")
         finally:
             core.time.sleep = original_sleep
-        self.assertEqual(snapshot.windows[0].percent, 7.0)
+        self.assertEqual(snapshot.windows[0].percent, 2.0)
 
     def test_network_error_classified(self):
         import requests
@@ -334,11 +446,11 @@ class TestRender(unittest.TestCase):
             account={"email": "<b>x</b>@y.z"},
             windows=[Window("5 小时额度", 63.0, "1h 52m", "18:32")],
         )
-        text = render_panel([snapshot], now="12:00:00")
+        text = render_panel([snapshot], now=datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc))
         self.assertNotIn("<script>", text)
         self.assertIn("&lt;script&gt;", text)
         self.assertIn("&lt;b&gt;x&lt;/b&gt;@y.z", text)
-        self.assertIn("12:00:00", text)
+        self.assertRegex(text, r"更新时间</b> \d{2}:\d{2}:\d{2}")
 
     def test_alias_with_markdown_chars_is_rendered_literally(self):
         snapshot = Snapshot(alias="a_b*c", key_mask="sk_1…7890", windows=[Window("本周额度", 50.0)])
@@ -347,12 +459,12 @@ class TestRender(unittest.TestCase):
         self.assertNotIn("**", text)
 
     def test_missing_fields_do_not_crash(self):
-        text = render_panel([Snapshot(alias="x", key_mask="****")], now="00:00:00")
+        text = render_panel([Snapshot(alias="x", key_mask="****")], now=datetime(2026, 9, 25, tzinfo=timezone.utc))
         self.assertIn("账号/别名：x", text)
 
     def test_split_panel_keeps_all_aliases(self):
         snapshots = [Snapshot(alias=f"acc{i}", key_mask="sk_1…7890", windows=[Window("本周额度", 50.0)]) for i in range(60)]
-        chunks = split_message(render_panel(snapshots, now="00:00:00"), 800)
+        chunks = split_message(render_panel(snapshots, now=datetime(2026, 9, 25, tzinfo=timezone.utc)), 800)
         joined = "\n".join(chunks)
         for i in range(60):
             self.assertIn(f"acc{i}", joined)

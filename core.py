@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import requests
@@ -28,9 +29,14 @@ log = logging.getLogger("clinepass.core")
 
 # ==================== 常量 ====================
 DEFAULT_API_BASE = "https://api.cline.bot"
-DEFAULT_USAGE_PATH = "/api/v1/user/usage"
+# ClinePass 官方额度接口：返回 5 小时 / 本周 / 本月三个窗口的已用百分比
+DEFAULT_USAGE_PATH = "/api/v1/users/me/plan/usage-limits"
 ACCOUNT_PATH = "/api/v1/users/me"
 PLAN_PATH = "/api/v1/users/me/plan"
+
+# 面板告警阈值（沿用 ClinePass 生态的约定：80% 预警，95% 视为耗尽）
+WARN_PERCENT = 80.0
+EXHAUSTED_PERCENT = 95.0
 
 CONFIG_VERSION = 1
 SECTION_SEP = "───────────────"
@@ -41,7 +47,17 @@ WINDOWS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         "h5",
         "5 小时额度",
-        ("h5", "5h", "five_hour", "five_hours", "last5hours", "last_5_hours", "last_5h"),
+        (
+            "five_hour",
+            "five_hours",
+            "5-hour",
+            "5_hour",
+            "5h",
+            "h5",
+            "last5hours",
+            "last_5_hours",
+            "last_5h",
+        ),
     ),
     (
         "week",
@@ -55,9 +71,9 @@ WINDOWS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
 )
 
-PERCENT_KEYS = ("percent", "percent_used", "used_percent", "usage_percent", "percentage", "used")
+PERCENT_KEYS = ("percentUsed", "percent", "percent_used", "used_percent", "usage_percent", "percentage", "used")
 REMAINING_KEYS = ("remaining_str", "remaining", "remaining_time", "remaining_human", "left_str")
-RESET_KEYS = ("reset_time", "reset_str", "reset_at", "resets_at", "reset", "next_reset")
+RESET_KEYS = ("resetsAt", "reset_time", "reset_str", "reset_at", "resets_at", "reset", "next_reset")
 
 ALIAS_RE = re.compile(r"^[\w\u4e00-\u9fff][\w\u4e00-\u9fff .\-]{0,23}$")
 
@@ -360,10 +376,28 @@ class Window:
     percent: Optional[float] = None
     remaining: Optional[str] = None
     reset: Optional[str] = None
+    reset_dt: Optional[datetime] = None
 
     @property
     def usable(self) -> bool:
-        return self.percent is not None or bool(self.remaining) or bool(self.reset)
+        return self.percent is not None or bool(self.remaining) or bool(self.reset) or self.reset_dt is not None
+
+    @property
+    def remaining_percent(self) -> Optional[float]:
+        if self.percent is None:
+            return None
+        return max(0.0, min(100.0, 100.0 - self.percent))
+
+    @property
+    def warning(self) -> str:
+        """80% 预警、95% 视为耗尽（与 ClinePass 生态的约定一致）。"""
+        if self.percent is None:
+            return ""
+        if self.percent >= EXHAUSTED_PERCENT:
+            return "⛔️"
+        if self.percent >= WARN_PERCENT:
+            return "⚠️"
+        return ""
 
 
 @dataclass
@@ -406,6 +440,121 @@ def _to_percent(value: Any) -> Optional[float]:
     return max(0.0, min(100.0, number))
 
 
+_TIMESTAMP_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?$"
+)
+
+
+def parse_timestamp(value: Any) -> Optional[datetime]:
+    """解析 resetsAt 时间戳。
+
+    官方返回的是纳秒精度 UTC 时间，例如 2026-09-25T14:32:27.073666206Z；
+    datetime.fromisoformat 无法直接吃下 9 位小数，这里先规范化到微秒。
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str):
+        return None
+    match = _TIMESTAMP_RE.match(value.strip())
+    if match is None:
+        return None
+    date, clock, fraction, zone = match.groups()
+    micro = ((fraction or "")[:6]).ljust(6, "0")
+    if zone in (None, "Z"):
+        offset = "+00:00"
+    elif ":" in zone:
+        offset = zone
+    else:
+        offset = f"{zone[:3]}:{zone[3:]}"
+    try:
+        return datetime.fromisoformat(f"{date}T{clock}.{micro}{offset}")
+    except ValueError:
+        return None
+
+
+def humanize_delta(seconds: float) -> str:
+    """把剩余秒数说成人话。"""
+    if seconds <= 0:
+        return "已到重置时间"
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "不到 1 分钟"
+    days, rest = divmod(minutes, 1440)
+    hours, mins = divmod(rest, 60)
+    if days:
+        return f"{days} 天 {hours} 小时" if hours else f"{days} 天"
+    if hours:
+        return f"{hours} 小时 {mins} 分" if mins else f"{hours} 小时"
+    return f"{mins} 分钟"
+
+
+def describe_reset(window: Window, now: Optional[datetime] = None) -> Optional[str]:
+    """重置时间：有精确时间戳就显示本地时间 + 倒计时，否则退回接口给的字符串。"""
+    if window.reset_dt is not None:
+        reference = now or datetime.now(timezone.utc)
+        seconds = (window.reset_dt - reference).total_seconds()
+        human = humanize_delta(seconds)
+        prefix = "" if human.startswith("已到") else "还有 "
+        return f"{window.reset_dt.astimezone().strftime('%m-%d %H:%M')}（{prefix}{human}）"
+    return window.reset
+
+
+def _window_key_for_type(raw_type: str) -> Optional[tuple[str, str]]:
+    """把接口的 type（five_hour / weekly / monthly）映射到展示窗口。"""
+    needle = raw_type.strip().lower().replace("-", "_").replace(" ", "_")
+    if not needle:
+        return None
+    for key, label, aliases in WINDOWS:
+        if needle in {alias.lower().replace("-", "_") for alias in aliases}:
+            return key, label
+    return None
+
+
+def parse_limits_list(payload: Any) -> Optional[list[Window]]:
+    """解析官方额度接口：`{success, data:{limits:[{type, percentUsed, resetsAt}]}}`。
+
+    type 为 five_hour / weekly / monthly。未知 type 也会保留成一行，
+    这样官方将来新增窗口时面板会直接多一行，而不必改代码。
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    roots: list[Mapping[str, Any]] = [payload]
+    nested = payload.get("data")
+    if isinstance(nested, Mapping):
+        roots.append(nested)
+
+    limits: Optional[list[Any]] = None
+    for root in roots:
+        candidate = root.get("limits")
+        if isinstance(candidate, list):
+            limits = candidate
+            break
+    if limits is None:
+        return None
+
+    known: dict[str, Window] = {}
+    extras: list[Window] = []
+    for item in limits:
+        if not isinstance(item, Mapping):
+            continue
+        raw_type = str(item.get("type") or "").strip()
+        matched = _window_key_for_type(raw_type)
+        window = Window(
+            label=matched[1] if matched else raw_type,
+            percent=_to_percent(item.get("percentUsed")),
+            reset_dt=parse_timestamp(item.get("resetsAt")),
+        )
+        if not window.usable:
+            continue
+        if matched:
+            known[matched[0]] = window
+        elif raw_type:
+            extras.append(window)
+
+    ordered = [known[key] for key, _, _ in WINDOWS if key in known]
+    return (ordered + extras) or None
+
+
 def _parse_window(raw: Any, label: str) -> Optional[Window]:
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
         return Window(label=label, percent=_to_percent(raw))
@@ -419,6 +568,7 @@ def _parse_window(raw: Any, label: str) -> Optional[Window]:
         percent=percent,
         remaining=_first_str(raw, REMAINING_KEYS),
         reset=_first_str(raw, RESET_KEYS),
+        reset_dt=parse_timestamp(raw.get("resetsAt") or raw.get("resets_at")),
     )
     return window if window.usable else None
 
@@ -426,12 +576,16 @@ def _parse_window(raw: Any, label: str) -> Optional[Window]:
 def parse_usage(payload: Any) -> Optional[list[Window]]:
     """宽容解析额度数据。
 
-    真实接口是 {"success": true, "data": {...}} 信封结构，但不同版本可能把额度放在
-    data / data.usage / usage 下，字段名也有 h5、5h、five_hour 等写法，这里都试一遍。
+    真实接口是 {"success": true, "data": {"limits": [...]}}，但社区里还流传着
+    data.h5/week/month 这类写法，两种都支持：先按官方 limits 列表解析，再退回字典形状。
     解析不到就返回 None，由上层显示“未提供”，绝不编造数字。
     """
     if not isinstance(payload, dict):
         return None
+
+    limits = parse_limits_list(payload)
+    if limits:
+        return limits
 
     roots: list[Mapping[str, Any]] = [payload]
     for container in (payload, payload.get("data") if isinstance(payload.get("data"), dict) else None):
@@ -631,7 +785,7 @@ def _plan_lines(plan: Optional[Mapping[str, Any]], period: Mapping[str, Any]) ->
     return lines
 
 
-def render_snapshot(snapshot: Snapshot) -> str:
+def render_snapshot(snapshot: Snapshot, now: Optional[datetime] = None) -> str:
     """把单个别名渲染成一段 HTML 消息。"""
     lines = [f"🔑 <b>账号/别名：{_esc(snapshot.alias)}</b>  <code>{_esc(snapshot.key_mask)}</code>"]
     lines.extend(_account_lines(snapshot.account))
@@ -639,14 +793,19 @@ def render_snapshot(snapshot: Snapshot) -> str:
 
     if snapshot.windows:
         for window in snapshot.windows:
-            block = [f"📊 <b>{_esc(window.label)}</b>（已用）"]
+            badge = f" {window.warning}" if window.warning else ""
+            block = [f"📊 <b>{_esc(window.label)}</b>（已用）{badge}".rstrip()]
             if window.percent is not None:
-                block.append(f"<code>{progress_bar(window.percent)}</code> {round(window.percent)}%")
+                tail = f"{round(window.percent)}%"
+                if window.remaining_percent is not None:
+                    tail += f" · 剩余 {round(window.remaining_percent)}%"
+                block.append(f"<code>{progress_bar(window.percent)}</code> {tail}")
             details = []
             if window.remaining:
                 details.append(f"剩余：{_esc(window.remaining)}")
-            if window.reset:
-                details.append(f"重置：{_esc(window.reset)}")
+            reset = describe_reset(window, now)
+            if reset:
+                details.append(f"重置：{_esc(reset)}")
             if details:
                 block.append("  ".join(details))
             lines.append("\n".join(block))
@@ -659,11 +818,12 @@ def render_snapshot(snapshot: Snapshot) -> str:
     return "\n".join(lines)
 
 
-def render_panel(snapshots: Sequence[Snapshot], now: Optional[str] = None) -> str:
+def render_panel(snapshots: Sequence[Snapshot], now: Optional[datetime] = None) -> str:
     """渲染整块面板（不含分片）。"""
-    stamp = now or time.strftime("%H:%M:%S")
+    moment = now or datetime.now(timezone.utc)
+    stamp = moment.astimezone().strftime("%H:%M:%S")
     sections = ["🤖 <b>ClinePass Status Panel</b>"]
-    sections.extend(render_snapshot(s) for s in snapshots)
+    sections.extend(render_snapshot(s, moment) for s in snapshots)
     sections.append(f"🔄 <b>更新时间</b> {_esc(stamp)}")
     return f"\n\n{SECTION_SEP}\n\n".join(sections)
 

@@ -12,22 +12,26 @@
 💳 Cline Pass (Monthly)（Monthly · ✅ 生效）
 📆 计费周期：2026-09-23 → 2026-10-23
 📊 5 小时额度（已用）
-██████░░░░ 63%
-剩余：1h 52m  重置：18:32
+░░░░░░░░░░ 2% · 剩余 98%
+重置：09-25 22:32（还有 4 小时 12 分）
 📊 本周额度（已用）
-█████░░░░░ 48%
-重置：周一 08:00
+██████░░░░ 57% · 剩余 43%
+重置：09-30 20:08（还有 5 天 1 小时）
+📊 本月额度（已用）
+███░░░░░░░ 28% · 剩余 72%
+重置：10-23 20:08（还有 28 天 1 小时）
 
 ───────────────
 
-🔄 更新时间 16:35:21
+🔄 更新时间 18:20:11
 ```
 
 ## 功能
 
 - **多 Key 管理**：`/addkey`、`/delkey`、`/keys`、`/clear`，每个用户的数据互相隔离
 - **安全的 Key 处理**：只显示掩码（`sk_7f2a…9c41`），含 Key 的消息自动撤回，配置文件权限 `600`
-- **额度面板**：多账号并行查询（`asyncio` + 线程池），不会阻塞 Bot 的其他用户
+- **真实额度**：调用官方 `plan/usage-limits`，展示 5 小时 / 本周 / 本月进度条、剩余百分比、重置时间与倒计时，`≥80%` 标 ⚠️、`≥95%` 标 ⛔️
+- **多账号并行查询**：`asyncio` + 线程池，不会阻塞 Bot 的其他用户
 - **不编造数据**：接口失败就显示失败原因，绝不拿"默认数字"冒充真实额度
 - **健壮存储**：JSON 原子写入、文件损坏自动备份重建、路径异常时明确报错
 - **可运维**：白名单、限流冷却、消息自动分片、错误统一兜底、结构化日志
@@ -84,7 +88,7 @@ python bot.py
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | 无（必填） | BotFather 给的 Token，缺失时启动即退出（退出码 1） |
 | `CLINEPASS_API_BASE` | `https://api.cline.bot` | API 根地址 |
-| `CLINEPASS_USAGE_PATH` | `/api/v1/user/usage` | 额度接口路径，见下文 |
+| `CLINEPASS_USAGE_PATH` | `/api/v1/users/me/plan/usage-limits` | 额度接口路径，见下文 |
 | `REQUEST_TIMEOUT` | `12` | 单次请求超时（秒） |
 | `HTTP_RETRIES` | `2` | 429 / 5xx / 网络错误的重试次数 |
 | `RETRY_BACKOFF` | `1.5` | 重试退避基数（秒），指数增长 |
@@ -124,37 +128,63 @@ python bot.py
 
 > ⚠️ 该文件保存的是**明文** API Key，已在 `.gitignore` 中排除，切勿提交或公开分享。
 
-## 额度接口说明（重要）
+## 额度接口说明
 
-原始版本把额度写死在环境变量里：只要接口一失败就显示 `63% / 48% / 31%` 这类固定数字，看起来很像真的，实际是假数据。现在改成"拿不到就说拿不到"。
+ClinePass 的额度来自官方接口：
 
-实测（使用真实的 Cline Pass 账号 Key）：
+```
+GET https://api.cline.bot/api/v1/users/me/plan/usage-limits
+Authorization: Bearer sk_xxx
+```
 
-| 接口 | 结果 |
+实测（真实 Cline Pass Key）返回：
+
+```json
+{
+  "success": true,
+  "data": {
+    "limits": [
+      { "type": "five_hour", "percentUsed": 2,  "resetsAt": "2026-09-25T14:32:27.073666206Z" },
+      { "type": "weekly",    "percentUsed": 57, "resetsAt": "2026-09-30T12:08:27.075836336Z" },
+      { "type": "monthly",   "percentUsed": 28, "resetsAt": "2026-10-23T12:08:27.07803017Z" }
+    ]
+  }
+}
+```
+
+要点：
+
+- `type` 就是 `five_hour` / `weekly` / `monthly`（**不是** `5-hour`）；`percentUsed` 是**已用**百分比；`resetsAt` 是纳秒精度的 UTC 时间
+- 面板据此渲染进度条、剩余百分比、重置时间和倒计时；`percentUsed ≥ 80%` 标 ⚠️，`≥ 95%` 标 ⛔️
+- 重置时间按容器时区显示（默认 `TZ=Asia/Shanghai`），因为接口给的是 UTC
+- 官方将来新增窗口类型会自动多显示一行，不必改代码
+
+面板另外会调用下面两个接口（失败不影响额度显示）：
+
+| 接口 | 用途 |
 | --- | --- |
-| `GET /api/v1/user/usage`（原默认值） | **404 Not Found** |
-| `GET /api/v1/users/me` | ✅ 200，返回 `{success, data:{id, email, displayName, ...}}` |
-| `GET /api/v1/users/me/plan` | ✅ 200，返回套餐名、`interval`、`isActive`、`currentPeriodStart/End`、`entitlements` |
+| `GET /api/v1/users/me` | 账号邮箱 / 显示名 |
+| `GET /api/v1/users/me/plan` | 套餐名、`interval`、`isActive`、计费周期 |
 
-也就是说：**账号与套餐信息是真实可用的，但官方当前并没有公开"5 小时 / 本周 / 本月百分比"的额度接口**，所以面板默认只展示账号、套餐、计费周期，额度区域显示"暂无可显示的额度数据"。
-
-如果你有自己的额度来源（反向代理、自建采集、官方后续新增的接口），把 `CLINEPASS_USAGE_PATH` 指向它即可，解析器会宽容地识别下面几种写法：
+原始版本用的默认地址 `GET /api/v1/user/usage` 实测是 **404**，这正是它当初只能显示写死数字的原因；现在默认已改为上面的官方路径。想换数据源（自建反代等）改 `CLINEPASS_USAGE_PATH` 即可，解析器同时兼容 `limits` 列表和下面这种字典写法：
 
 ```json
 {
   "success": true,
   "data": {
     "h5":    { "percent": 63, "remaining_str": "1h 52m", "reset_time": "18:32" },
-    "week":  { "percent": 48, "reset_str": "周一 08:00" },
+    "week":  { "percent": 48 },
     "month": { "percent": 31 }
   }
 }
 ```
 
 - 信封层可有可无：顶层、`data`、`data.usage`、`usage` 都会被尝试
-- 窗口名支持 `h5 / 5h / five_hour`、`week / weekly / 7d`、`month / monthly / 30d` 等别名
-- 百分比字段支持 `percent / percent_used / used_percent / usage_percent`，数值会被夹到 0–100
-- 解析不到任何额度字段时显示"接口已响应，但未包含可识别的额度字段"
+- 窗口名支持 `five_hour / 5-hour / 5h`、`weekly / week`、`monthly / month` 等别名
+- 百分比字段支持 `percentUsed / percent / percent_used / used_percent / usage_percent`，数值夹到 0–100
+- 解析不到额度时显示"接口已响应，但未包含可识别的额度字段"，绝不编造数字
+
+> 同类实现可对照 [`yhshzh/dsh-cline-pass`](https://github.com/yhshzh/dsh-cline-pass)（把 `five_hour` 映射为 fiveHour，与线上一致）和 [`GooDAnDReaDY/dsh-clinebot`](https://github.com/GooDAnDReaDY/dsh-clinebot)。后者用的是 `parseWindow('5-hour')`，与线上返回的 `five_hour` 并不匹配，读它的代码时留意这一点。
 
 想先看面板长什么样，可以设 `DEMO_MODE=1`：会渲染示例数字并明确标注 🧪。
 
@@ -171,7 +201,7 @@ python bot.py
 .
 ├── bot.py                # Telegram 交互层：指令、鉴权、限流、错误兜底
 ├── core.py               # 核心逻辑：JSON 存储、API 客户端、面板渲染（无 PTB 依赖，可单测）
-├── tests/test_core.py    # 32 个单元测试，纯标准库
+├── tests/test_core.py    # 43 个单元测试，纯标准库
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -187,7 +217,7 @@ python bot.py
 python3 -m unittest discover -s tests -t . -v
 ```
 
-覆盖范围：进度条边界、别名校验、消息分片（含超长单行硬切）、冷却器、配置读写/上限/权限/损坏恢复/目录异常、额度解析（信封/别名/嵌套/非法值）、客户端的成功、401、404、503 重试、网络异常、非 JSON 响应、DEMO 模式、HTML 转义与长面板分片。
+覆盖范围：进度条边界、别名校验、消息分片（含超长单行硬切）、冷却器、配置读写/上限/权限/损坏恢复/目录异常、官方额度接口解析（`five_hour`/`weekly`/`monthly`、未知类型、非法值、空列表）、纳秒时间戳解析、重置倒计时、80%/95% 告警、客户端的成功、401、404、503 重试、网络异常、非 JSON 响应、DEMO 模式、HTML 转义与长面板分片。
 
 ## 故障排查
 
@@ -196,7 +226,8 @@ python3 -m unittest discover -s tests -t . -v
 | 启动即退出，日志 `未配置 TELEGRAM_BOT_TOKEN` | 没读到 Token；本地检查 `export`，容器检查 `.env` |
 | `❌ 配置存储不可用 … 是一个目录` | 宿主机上把不存在的 `config.json` 文件挂进了容器；改用挂载目录（见下） |
 | `❌ 保存失败，Key 没有被记录` | 挂载目录属主不对，容器内 uid 10001 无写权限 |
-| `📊 额度接口不可用：接口不存在（404）` | 正常现象，见「额度接口说明」；配置自己的 `CLINEPASS_USAGE_PATH` |
+| `📊 额度接口不可用：接口不存在（404）` | 默认路径已对准官方接口；若你改过 `CLINEPASS_USAGE_PATH`，检查拼写 |
+| `📊 额度接口不可用：API Key 无效（401）` | 该 Key 已失效，重新 `/addkey` |
 | `🔒 API Key 无效或已过期（401）` | 该 Key 无效/过期，重新 `/addkey` |
 | 面板只发出了一部分 | 已按 `MESSAGE_LIMIT` 自动分片，属正常 |
 | `⏳ 操作太快了` | `STATUS_COOLDOWN` 限流，稍等即可 |
@@ -218,6 +249,7 @@ docker compose cp clinepass-bot:/app/data/config.json ./config.json.bak
 ## 与旧版本的差异
 
 - 删除了"接口失败就用环境变量里的固定数字"的兜底逻辑——那是假数据；`CLINEPASS_5H_USAGE` 等变量随之失效，需要示例数据请用 `DEMO_MODE=1`
+- 额度接口从 `GET /api/v1/user/usage`（实测 404）改为官方 `GET /api/v1/users/me/plan/usage-limits`，并新增剩余百分比、重置倒计时、80%/95% 告警
 - `CLINEPASS_API_URL` → 拆成 `CLINEPASS_API_BASE` + `CLINEPASS_USAGE_PATH`
 - `config.json` 由 `bot.py` 同级改为可配置，容器内落进数据卷
 - 新增 `core.py`、单元测试、`.env.example`、`.gitignore`、`.dockerignore`
