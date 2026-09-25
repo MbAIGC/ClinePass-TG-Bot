@@ -28,7 +28,7 @@ import requests
 log = logging.getLogger("clinepass.core")
 
 # 版本号（单一来源：bot 启动日志、/help、面板标题都取这里）
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 # ==================== 常量 ====================
 DEFAULT_API_BASE = "https://api.cline.bot"
@@ -326,13 +326,30 @@ class ConfigStore:
 
 
 def sanitize_alias(raw: str) -> Optional[str]:
-    """校验并规范化别名；不合法返回 None。"""
+    """校验并规范化别名；不合法返回 None。
+
+    规则：1–24 个字符，首字符为中文/字母/数字/下划线，其余还可含空格、点、连字符。
+    因此 `主账号`、`Cline-01`、`cline_01`、`Cline.01` 都合法；`#`、`/`、`:`、emoji 不合法。
+    """
     alias = (raw or "").strip()
     if not alias or len(alias) > 24:
         return None
     if not ALIAS_RE.match(alias):
         return None
     return alias
+
+
+def split_alias_and_key(args: Sequence[str]) -> tuple[Optional[str], str]:
+    """把 `/addkey` 的参数拆成 (别名, API Key)。
+
+    Telegram 按空白切分命令参数，带空格的别名会被拆成多个 token
+    （`/addkey Cline 01 sk_xxx` → `["Cline", "01", "sk_xxx"]`）。
+    这里约定**最后一个 token 是 Key**，其余拼回别名，所以带空格的别名也能用。
+    """
+    tokens = [t for t in (args or []) if isinstance(t, str) and t.strip()]
+    if len(tokens) < 2:
+        return None, ""
+    return sanitize_alias(" ".join(tokens[:-1])), tokens[-1].strip()
 
 
 def mask_key(api_key: str) -> str:

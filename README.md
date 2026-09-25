@@ -1,6 +1,6 @@
 # 🤖 ClinePass TG Bot
 
-> 当前版本 **0.0.2**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
+> 当前版本 **0.0.3**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
 
 把 Cline / ClinePass 账号的用量做成 Telegram 面板：一个用户可绑定多个 API Key，`/status` 一次看全部账号。
 
@@ -69,6 +69,18 @@ python bot.py
 2. `/addkey 主账号 sk_你的key`
 3. `/status` 查看面板
 
+**别名随便起**，不必是中文，`Cline-01`、`cline_01`、`Cline.01`、`Codex 备用` 都可以：
+
+| 规则 | 说明 |
+| --- | --- |
+| 长度 | 1–24 个字符 |
+| 首字符 | 中文、字母、数字或下划线（不能以空格、`.`、`-` 开头） |
+| 其余字符 | 中文、字母、数字、下划线、空格、`.`、`-` |
+| 不支持 | `#`、`/`、`:`、`@`、括号、emoji 等 |
+
+> 别名里可以带空格：Bot 把**最后一个参数当 Key**，前面的都算别名，
+> 所以 `/addkey Codex 备用 sk_xxx` 存下来的别名就是 `Codex 备用`。
+
 ## 指令一览
 
 | 指令 | 说明 |
@@ -76,7 +88,7 @@ python bot.py
 | `/start` | 欢迎语与上手引导 |
 | `/help` | 指令帮助 |
 | `/status`（别名 `/quota`） | 查询所有已绑定 Key 的额度面板 |
-| `/addkey <别名> <API_KEY>` | 添加或更新 Key（仅私聊） |
+| `/addkey <别名> <API_KEY>` | 添加或更新 Key，如 `/addkey Cline-01 sk_xxx`（仅私聊） |
 | `/delkey <别名>` | 删除指定 Key（仅私聊） |
 | `/keys` | 列出已绑定的别名与掩码（仅私聊） |
 | `/clear confirm` | 清空自己的全部 Key（仅私聊） |
@@ -204,7 +216,7 @@ Authorization: Bearer sk_xxx
 ├── .github/workflows/ci.yml  # CI：单测矩阵 → 构建镜像+冒烟 → 打标签时推 GHCR
 ├── bot.py                # Telegram 交互层：指令、鉴权、限流、错误兜底
 ├── core.py               # 核心逻辑：JSON 存储、API 客户端、面板渲染（无 PTB 依赖，可单测）
-├── tests/test_core.py    # 49 个单元测试，纯标准库
+├── tests/test_core.py    # 56 个单元测试，纯标准库
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -220,7 +232,7 @@ Authorization: Bearer sk_xxx
 python3 -m unittest discover -s tests -t . -v
 ```
 
-覆盖范围：进度条边界、别名校验、消息分片（含超长单行硬切）、冷却器、配置读写/上限/权限/损坏恢复/目录异常/写入失败转 ConfigError、官方额度接口解析（`five_hour`/`weekly`/`monthly`、未知类型、非法值、空列表）、纳秒时间戳解析、重置倒计时、80%/95% 告警、版本号、客户端的成功、401、404、503 重试、网络异常、非 JSON 响应、DEMO 模式、HTML 转义与长面板分片。
+覆盖范围：进度条边界、别名规则与 `/addkey` 参数拆分（多词别名、最后一段才是 Key）、消息分片（含超长单行硬切）、冷却器、配置读写/上限/权限/损坏恢复/目录异常/写入失败转 ConfigError、官方额度接口解析（`five_hour`/`weekly`/`monthly`、未知类型、非法值、空列表）、纳秒时间戳解析、重置倒计时、80%/95% 告警、版本号、客户端的成功、401、404、503 重试、网络异常、非 JSON 响应、DEMO 模式、HTML 转义与长面板分片。
 
 ## 持续集成与发布
 
@@ -228,27 +240,27 @@ python3 -m unittest discover -s tests -t . -v
 
 | job | 内容 |
 | --- | --- |
-| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 49 个单元测试 |
+| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 56 个单元测试 |
 | `docker` | buildx 构建镜像（带 gha 缓存）→ 镜像内自检：能导入、非 root(10001)、命名卷可写配置、缺 Token 时退出码为 1 |
 | `publish` | 仅在 `main` 分支或 `v*` 标签上触发，推送到 GHCR（`ghcr.io/mbaigc/clinepass-tg-bot`） |
 
 发布一个新版本：
 
 ```bash
-# 1) 改 core.py 里的 __version__（例如 0.0.2），提交并推送
-vim core.py && git commit -am "release: 0.0.2" && git push
+# 1) 改 core.py 里的 __version__（例如 0.0.3），提交并推送
+vim core.py && git commit -am "release: 0.0.3" && git push
 
 # 2) 打标签并推送，CI 会自动构建并推送镜像
-git tag v0.0.2 && git push origin v0.0.2
+git tag v0.0.3 && git push origin v0.0.3
 ```
 
-镜像标签规则：`v0.0.2` → `0.0.2`、`0.0`；`main` 分支 → `main` 与 `latest`。镜像公开后可以直接部署：
+镜像标签规则：`v0.0.3` → `0.0.3`、`0.0`；`main` 分支 → `main` 与 `latest`。镜像公开后可以直接部署：
 
 ```bash
 docker run -d --name clinepass_tg_bot --restart unless-stopped \
   -e TELEGRAM_BOT_TOKEN=xxx \
   -v clinepass-data:/app/data \
-  ghcr.io/mbaigc/clinepass-tg-bot:0.0.2
+  ghcr.io/mbaigc/clinepass-tg-bot:0.0.3
 ```
 
 > 上面用的是**命名卷**，Docker 会把镜像里 `/app/data` 的属主（uid 10001）带过来，开箱可写。
@@ -286,7 +298,7 @@ docker compose up -d
 ```bash
 docker compose down
 docker run --rm --user root -v clinepass-data:/app/data \
-  ghcr.io/mbaigc/clinepass-tg-bot:0.0.2 chown -R 10001:10001 /app/data
+  ghcr.io/mbaigc/clinepass-tg-bot:0.0.3 chown -R 10001:10001 /app/data
 docker compose up -d
 ```
 
@@ -313,6 +325,7 @@ docker compose cp clinepass-bot:/app/data/config.json ./config.json.bak   # 备�
 
 | 版本 | 说明 |
 | --- | --- |
+| **0.0.3** | `/addkey` 约定「最后一个参数是 Key，其余拼成别名」，带空格的别名（`Codex 备用`）不再是坑；别名规则与报错文案写清楚（`Cline-01` 一直合法） |
 | **0.0.2** | 修复：挂载目录不可写时 `tempfile.mkstemp` 抛出的 `PermissionError` 会漏出，导致进程崩在启动阶段；现在统一转成带修复指引的 `ConfigError`，Bot 降级运行并在日志/聊天里说明原因 |
 | 0.0.1 | 首个版本：官方额度接口、多 Key 面板、Docker 镜像与 GHCR 发布 |
 

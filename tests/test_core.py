@@ -520,6 +520,47 @@ class TestVersion(unittest.TestCase):
         self.assertIn(f"v{core.__version__}", text)
 
 
+# ==================== /addkey 参数拆分 ====================
+class TestAliasSplit(unittest.TestCase):
+    def test_alias_allows_hyphen_dot_underscore(self):
+        for alias in ("主账号", "Cline-01", "cline_01", "Cline.01", "01", "a" * 24, "Cline 01"):
+            self.assertEqual(core.sanitize_alias(alias), alias, alias)
+
+    def test_alias_rejects_bad_input(self):
+        for alias in ("", "   ", "a" * 25, "-bad", "Cline#01", "Cline/01", "Cline:01", "主账号（备用）", "🚀"):
+            self.assertIsNone(core.sanitize_alias(alias), alias)
+
+    def test_last_token_is_the_key(self):
+        self.assertEqual(
+            core.split_alias_and_key(["Cline-01", "sk_1234567890"]),
+            ("Cline-01", "sk_1234567890"),
+        )
+
+    def test_multiword_alias_is_joined_back(self):
+        """Telegram 按空白切参数，多词别名要能拼回来。"""
+        self.assertEqual(
+            core.split_alias_and_key(["Cline", "01", "sk_1234567890"]),
+            ("Cline 01", "sk_1234567890"),
+        )
+
+    def test_needs_at_least_two_tokens(self):
+        for args in ([], ["onlyalias"], ["", "   "]):
+            alias, key = core.split_alias_and_key(args)
+            self.assertEqual(key, "", args)
+            self.assertIsNone(alias, args)
+
+    def test_whitespace_is_trimmed(self):
+        self.assertEqual(
+            core.split_alias_and_key([" 主账号 ", " sk_1234567890 "]),
+            ("主账号", "sk_1234567890"),
+        )
+
+    def test_oversized_joined_alias_is_rejected_key_kept(self):
+        alias, key = core.split_alias_and_key(["a" * 20, "b" * 10, "sk_1234567890"])
+        self.assertIsNone(alias)
+        self.assertEqual(key, "sk_1234567890")
+
+
 # ==================== Settings ====================
 class TestSettings(unittest.TestCase):
     def test_defaults_and_bad_values(self):

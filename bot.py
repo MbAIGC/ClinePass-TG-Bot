@@ -30,7 +30,7 @@ from core import (
     esc,
     mask_key,
     render_panel,
-    sanitize_alias,
+    split_alias_and_key,
     split_message,
 )
 
@@ -190,18 +190,23 @@ async def addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         log.warning("撤回含 Key 的消息失败：%s", exc)
 
     args = context.args or []
-    if len(args) < 2:
+    alias, api_key = split_alias_and_key(args)
+    if not api_key:
         await say(
             "⚠️ 参数不完整。\n"
             "格式：<code>/addkey &lt;别名&gt; &lt;API_KEY&gt;</code>\n"
-            "示例：<code>/addkey 主账号 sk_1234567890</code>"
+            "示例：<code>/addkey 主账号 sk_1234567890</code>\n"
+            "　　　<code>/addkey Cline-01 sk_1234567890</code>"
         )
         return
 
-    alias = sanitize_alias(args[0])
-    api_key = args[1].strip()
     if alias is None:
-        await say("⚠️ 别名不合法：需为 1–24 个字符，仅限中英文、数字、下划线、点、连字符和空格。")
+        await say(
+            "⚠️ 别名不合法：1–24 个字符，以中英文、数字或下划线开头，"
+            "之后可含空格、点、连字符"
+            "（<code>#</code>、<code>/</code>、<code>:</code>、emoji 不行）。\n"
+            "示例：<code>/addkey 主账号 sk_1234567890</code>、<code>/addkey Cline-01 sk_1234567890</code>"
+        )
         return
     if len(api_key) < 8 or any(ch.isspace() for ch in api_key):
         await say("⚠️ API Key 看起来不合法（长度需 ≥ 8 且不含空白字符）。")
