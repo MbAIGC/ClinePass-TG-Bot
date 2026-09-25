@@ -38,6 +38,7 @@ from core import (
     Settings,
     __version__,
     esc,
+    key_shape_note,
     mask_key,
     normalize_api_key,
     parse_command_candidates,
@@ -228,7 +229,7 @@ async def keys_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
     lines = ["📋 <b>已绑定的 Key</b>", ""]
-    lines.extend(f"• <b>{esc(alias)}</b>：<code>{esc(mask_key(key))}</code>" for alias, key in user_keys.items())
+    lines.extend(f"• <b>{esc(alias)}</b>：<code>{esc(mask_key(key, show_length=True))}</code>" for alias, key in user_keys.items())
     lines.append("")
     lines.append(f"共 {len(user_keys)} 个")
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
@@ -303,9 +304,13 @@ async def addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     note = "（含 Key 的消息已撤回）" if deleted else "（⚠️ 未能撤回原消息，建议自行删除）"
     if key_cleaned:
         note += "\n🧹 已自动去掉 Key 里夹带的不可见字符"
+    # 复制不全是最常见的 401 原因，绑定当场就提醒，别等 /status
+    shape = key_shape_note(api_key)
+    if shape:
+        note += "\n" + esc(shape)
     await say(
         f"✅ 已保存 Key\n📌 别名：<code>{esc(alias)}</code>\n"
-        f"🔐 Key：<code>{esc(mask_key(api_key))}</code>\n{note}"
+        f"🔐 Key：<code>{esc(mask_key(api_key, show_length=True))}</code>\n{note}"
     )
 
 

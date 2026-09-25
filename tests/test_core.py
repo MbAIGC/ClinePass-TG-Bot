@@ -422,6 +422,24 @@ class TestClient(unittest.TestCase):
         # 401 后不再请求其它接口
         self.assertEqual(session.calls, ["/api/v1/users/me"])
 
+    def test_invalid_key_reports_cline_message_and_shape(self):
+        """Cline 的原话 + Key 长度都要带出来 —— 这是排查 401 的关键线索。"""
+        session = FakeSession(
+            {"/api/v1/users/me": FakeResponse(401, {"error": "Unauthorized: please re-authenticate"})}
+        )
+        snapshot = ClinePassClient(self.settings, session=session).fetch_snapshot_sync("x", "sk_shortkey12345")
+        joined = "\n".join(snapshot.warnings)
+        self.assertIn("re-authenticate", joined)
+        self.assertIn("16 个字符", joined)
+        self.assertIn("sk_s…2345", snapshot.key_mask)
+
+    def test_long_invalid_key_gets_no_length_warning(self):
+        key = "sk_" + "a" * 64
+        session = FakeSession({"/api/v1/users/me": FakeResponse(401, {"error": "Unauthorized"})})
+        snapshot = ClinePassClient(self.settings, session=session).fetch_snapshot_sync("x", key)
+        self.assertNotIn("很可能复制", "\n".join(snapshot.warnings))
+        self.assertIn("67 字符", snapshot.key_mask)
+
     def test_missing_usage_endpoint_is_reported_not_faked(self):
         session = FakeSession(
             {
@@ -546,6 +564,51 @@ class TestSelfCheck(unittest.TestCase):
         self.assertEqual(self.store.add(1, "a", "sk_123456789"), 1)
         self.assertEqual(self.store.add(1, "b", "sk_123456789"), 2)
         self.assertEqual(self.store.add(1, "a", "sk_987654321"), 2)
+
+
+# ==================== Key 掩码与长度提示 ====================
+class TestKeyMaskAndShape(unittest.TestCase):
+    def test_mask_without_length(self):
+        self.assertEqual(core.mask_key("sk_0123456789abcdef"), "sk_0…cdef")
+
+    def test_mask_with_length(self):
+        self.assertEqual(core.mask_key("sk_0123456789abcdef", show_length=True), "sk_0…cdef · 19 字符")
+
+    def test_mask_short_key(self):
+        self.assertEqual(core.mask_key("short"), "****")
+        self.assertEqual(core.mask_key(""), "****")
+        self.assertEqual(core.mask_key("short", show_length=True), "**** · 5 字符")
+
+    def test_shape_note_empty(self):
+        self.assertIn("空的", core.key_shape_note(""))
+
+    def test_shape_note_too_short(self):
+        note = core.key_shape_note("sk_05b052fdfgdfgdfgfdg")  # 22 位，明显是截断的
+        self.assertIn("22 个字符", note)
+        self.assertIn(str(core.TYPICAL_KEY_LENGTH), note)
+
+    def test_shape_note_silent_for_plausible_lengths(self):
+        self.assertEqual(core.key_shape_note("sk_" + "a" * 59), "")
+        self.assertEqual(core.key_shape_note("sk_" + "a" * 64), "")
+
+
+class TestApiErrorFriendly(unittest.TestCase):
+    def test_unauthorized_includes_server_detail(self):
+        err = core.ApiError("unauthorized", "Unauthorized: please re-authenticate", 401)
+        self.assertIn("re-authenticate", err.friendly)
+        self.assertIn("401", err.friendly)
+
+    def test_detail_is_flattened_and_truncated(self):
+        err = core.ApiError("unauthorized", "a\n\nb " + "x" * 500, 401)
+        self.assertNotIn("\n\n", err.friendly)
+        self.assertLessEqual(len(err.friendly), 220)
+
+    def test_other_kinds_do_not_leak_detail(self):
+        err = core.ApiError("rate_limited", "internal detail", 429)
+        self.assertNotIn("internal", err.friendly)
+
+    def test_empty_detail_is_fine(self):
+        self.assertIn("401", core.ApiError("unauthorized", "", 401).friendly)
 
 
 # ==================== 命令文本修复 ====================

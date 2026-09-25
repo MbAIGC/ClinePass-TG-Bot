@@ -28,7 +28,7 @@ import requests
 log = logging.getLogger("clinepass.core")
 
 # 版本号（单一来源：bot 启动日志、/help、面板标题都取这里）
-__version__ = "0.0.6"
+__version__ = "0.0.7"
 
 #: 日志里必须抹掉的两个东西：Telegram Bot Token（藏在 httpx 的 URL 里、也藏在
 #: PTB 异常消息里）和 ClinePass API Key
@@ -541,12 +541,34 @@ def split_alias_and_key(args: Sequence[str]) -> tuple[Optional[str], str]:
     return sanitize_alias(" ".join(tokens[:-1])), tokens[-1].strip()
 
 
-def mask_key(api_key: str) -> str:
-    """只展示首尾各 4 位。"""
+def mask_key(api_key: str, show_length: bool = False) -> str:
+    """只展示首尾各 4 位；`show_length` 时附上总长度（排查 401 时最有用）。"""
     key = (api_key or "").strip()
     if len(key) <= 8:
-        return "****"
-    return f"{key[:4]}…{key[-4:]}"
+        masked = "****"
+    else:
+        masked = f"{key[:4]}…{key[-4:]}"
+    if show_length and key:
+        masked += f" · {len(key)} 字符"
+    return masked
+
+
+#: 实测有效的 Cline API Key 是 67 个字符（`sk_` + 64）；短得离谱基本都是没复制全
+TYPICAL_KEY_LENGTH = 67
+_MIN_PLAUSIBLE_KEY_LENGTH = 50
+
+
+def key_shape_note(api_key: str) -> str:
+    """Key 长度明显不对时给一句提醒（Cline 的 401 不区分"截断"与"已失效"）。"""
+    length = len((api_key or "").strip())
+    if length == 0:
+        return "⚠️ 当前 Key 是空的，请重新 /addkey 绑定。"
+    if length < _MIN_PLAUSIBLE_KEY_LENGTH:
+        return (
+            f"⚠️ 当前 Key 只有 {length} 个字符（Cline 的 Key 通常是 {TYPICAL_KEY_LENGTH} 个），"
+            "很可能复制时漏了尾巴，请重新复制完整 Key 再 /addkey。"
+        )
+    return ""
 
 
 # ==================== API 客户端 ====================
@@ -573,8 +595,10 @@ class ApiError(RuntimeError):
     @property
     def friendly(self) -> str:
         base = self.MESSAGES.get(self.kind, "未知接口错误")
-        if self.kind == "not_found" and self.detail:
-            return base
+        # 401/403 时把 Cline 自己的原话带上 —— 它比我们猜的原因准得多
+        if self.kind in {"unauthorized", "forbidden"} and self.detail:
+            detail = " ".join(str(self.detail).split())[:160]
+            return f"{base}\nCline 返回：{detail}"
         return base
 
 
@@ -916,13 +940,17 @@ class ClinePassClient:
         return data if isinstance(data, dict) else payload
 
     def fetch_snapshot_sync(self, alias: str, api_key: str) -> Snapshot:
-        snapshot = Snapshot(alias=alias, key_mask=mask_key(api_key))
+        snapshot = Snapshot(alias=alias, key_mask=mask_key(api_key, show_length=True))
 
         try:
             snapshot.account = dict(self._unwrap(self.get_json(ACCOUNT_PATH, api_key)))
         except ApiError as exc:
             if exc.kind in {"unauthorized", "forbidden"}:
                 snapshot.warnings.append(f"🔒 {exc.friendly}")
+                # 401 是最常见的求助场景：顺手把"Key 是不是没复制全"也说了
+                note = key_shape_note(api_key)
+                if note:
+                    snapshot.warnings.append(note)
                 return snapshot
             snapshot.warnings.append(f"👤 账号信息获取失败：{exc.friendly}")
 
