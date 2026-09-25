@@ -28,7 +28,7 @@ import requests
 log = logging.getLogger("clinepass.core")
 
 # 版本号（单一来源：bot 启动日志、/help、面板标题都取这里）
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 # ==================== 常量 ====================
 DEFAULT_API_BASE = "https://api.cline.bot"
@@ -289,13 +289,43 @@ class ConfigStore:
         except OSError:
             pass
 
+    def self_check(self) -> tuple[bool, str]:
+        """冒烟探针：确认配置目录真的能写。
+
+        用来把「能读但写不进去」这种最阴的故障提前暴露出来——它平时不报错，
+        只在你 /addkey 时才炸，看起来就像「命令没生效」。不留下任何文件。
+        """
+        try:
+            self._check_path()
+        except ConfigError as exc:
+            return False, str(exc)
+        parent = os.path.dirname(os.path.abspath(self.path)) or "."
+        probe = ""
+        try:
+            fd, probe = tempfile.mkstemp(prefix=".config-probe-", suffix=".tmp", dir=parent)
+            os.close(fd)
+        except OSError as exc:
+            self._discard(probe)
+            return False, f"目录 {parent} 不可写：{exc}"
+        self._discard(probe)
+        if os.path.exists(self.path):
+            if not os.access(self.path, os.W_OK):
+                return False, f"{self.path} 不可写"
+            try:
+                with open(self.path, "r", encoding="utf-8") as fh:
+                    json.load(fh)
+            except (OSError, ValueError) as exc:
+                return False, f"{self.path} 读不出来：{exc}"
+        return True, f"{parent} 可写"
+
     # ---- 业务操作 ----
     def keys(self, user_id: int) -> dict[str, str]:
         data = self.load()
         user_keys = data["user_keys"].get(str(user_id)) or {}
         return {str(k): str(v) for k, v in user_keys.items()}
 
-    def add(self, user_id: int, alias: str, api_key: str) -> None:
+    def add(self, user_id: int, alias: str, api_key: str) -> int:
+        """保存/覆盖一个别名，返回该用户当前的 Key 个数。"""
         data = self.load()
         user_keys = data["user_keys"].setdefault(str(user_id), {})
         if alias not in user_keys and len(user_keys) >= self.max_keys_per_user:
@@ -304,6 +334,7 @@ class ConfigStore:
             )
         user_keys[alias] = api_key
         self.save(data)
+        return len(user_keys)
 
     def delete(self, user_id: int, alias: str) -> bool:
         data = self.load()

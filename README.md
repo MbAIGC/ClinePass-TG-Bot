@@ -1,6 +1,6 @@
 # 🤖 ClinePass TG Bot
 
-> 当前版本 **0.0.3**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
+> 当前版本 **0.0.4**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
 
 把 Cline / ClinePass 账号的用量做成 Telegram 面板：一个用户可绑定多个 API Key，`/status` 一次看全部账号。
 
@@ -92,7 +92,7 @@ python bot.py
 | `/delkey <别名>` | 删除指定 Key（仅私聊） |
 | `/keys` | 列出已绑定的别名与掩码（仅私聊） |
 | `/clear confirm` | 清空自己的全部 Key（仅私聊） |
-| `/id` | 查看自己的 Telegram 用户 ID |
+| `/id` | 诊断信息：用户 ID、会话、版本、容器名、配置文件、存储是否可写、自己绑了几个 Key |
 
 > 涉及 Key 的指令只在**私聊**生效，避免在群里泄露账号信息；`/addkey` 发出的那条消息会被 Bot 立即撤回。
 
@@ -216,7 +216,7 @@ Authorization: Bearer sk_xxx
 ├── .github/workflows/ci.yml  # CI：单测矩阵 → 构建镜像+冒烟 → 打标签时推 GHCR
 ├── bot.py                # Telegram 交互层：指令、鉴权、限流、错误兜底
 ├── core.py               # 核心逻辑：JSON 存储、API 客户端、面板渲染（无 PTB 依赖，可单测）
-├── tests/test_core.py    # 56 个单元测试，纯标准库
+├── tests/test_core.py    # 61 个单元测试，纯标准库
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -232,7 +232,7 @@ Authorization: Bearer sk_xxx
 python3 -m unittest discover -s tests -t . -v
 ```
 
-覆盖范围：进度条边界、别名规则与 `/addkey` 参数拆分（多词别名、最后一段才是 Key）、消息分片（含超长单行硬切）、冷却器、配置读写/上限/权限/损坏恢复/目录异常/写入失败转 ConfigError、官方额度接口解析（`five_hour`/`weekly`/`monthly`、未知类型、非法值、空列表）、纳秒时间戳解析、重置倒计时、80%/95% 告警、版本号、客户端的成功、401、404、503 重试、网络异常、非 JSON 响应、DEMO 模式、HTML 转义与长面板分片。
+覆盖范围：进度条边界、别名规则与 `/addkey` 参数拆分（多词别名、最后一段才是 Key）、存储自检探针、消息分片（含超长单行硬切）、冷却器、配置读写/上限/权限/损坏恢复/目录异常/写入失败转 ConfigError、官方额度接口解析（`five_hour`/`weekly`/`monthly`、未知类型、非法值、空列表）、纳秒时间戳解析、重置倒计时、80%/95% 告警、版本号、客户端的成功、401、404、503 重试、网络异常、非 JSON 响应、DEMO 模式、HTML 转义与长面板分片。
 
 ## 持续集成与发布
 
@@ -240,27 +240,27 @@ python3 -m unittest discover -s tests -t . -v
 
 | job | 内容 |
 | --- | --- |
-| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 56 个单元测试 |
+| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 61 个单元测试 |
 | `docker` | buildx 构建镜像（带 gha 缓存）→ 镜像内自检：能导入、非 root(10001)、命名卷可写配置、缺 Token 时退出码为 1 |
 | `publish` | 仅在 `main` 分支或 `v*` 标签上触发，推送到 GHCR（`ghcr.io/mbaigc/clinepass-tg-bot`） |
 
 发布一个新版本：
 
 ```bash
-# 1) 改 core.py 里的 __version__（例如 0.0.3），提交并推送
-vim core.py && git commit -am "release: 0.0.3" && git push
+# 1) 改 core.py 里的 __version__（例如 0.0.4），提交并推送
+vim core.py && git commit -am "release: 0.0.4" && git push
 
 # 2) 打标签并推送，CI 会自动构建并推送镜像
-git tag v0.0.3 && git push origin v0.0.3
+git tag v0.0.4 && git push origin v0.0.4
 ```
 
-镜像标签规则：`v0.0.3` → `0.0.3`、`0.0`；`main` 分支 → `main` 与 `latest`。镜像公开后可以直接部署：
+镜像标签规则：`v0.0.4` → `0.0.4`、`0.0`；`main` 分支 → `main` 与 `latest`。镜像公开后可以直接部署：
 
 ```bash
 docker run -d --name clinepass_tg_bot --restart unless-stopped \
   -e TELEGRAM_BOT_TOKEN=xxx \
   -v clinepass-data:/app/data \
-  ghcr.io/mbaigc/clinepass-tg-bot:0.0.3
+  ghcr.io/mbaigc/clinepass-tg-bot:0.0.4
 ```
 
 > 上面用的是**命名卷**，Docker 会把镜像里 `/app/data` 的属主（uid 10001）带过来，开箱可写。
@@ -274,6 +274,7 @@ docker run -d --name clinepass_tg_bot --restart unless-stopped \
 | `PermissionError: … /app/data/.config-*.tmp`（0.0.1 会直接崩） | 挂载目录属主不是 uid 10001，见下方「挂载与权限」 |
 | `❌ 配置存储不可用 … 权限不足`（0.0.2 起的不崩版本） | 同上，日志里的提示就是修复命令 |
 | `❌ 配置存储不可用 … 是一个目录` | 宿主机上把不存在的 `config.json` **文件**挂进了容器；改成挂载目录 |
+| `/addkey` 后 `/status` 仍说没有 Key | 先发 `/id`（0.0.4+）看存储是否可写；多半是「文件可读、目录不可写」，见下方排查 |
 | `📊 额度接口不可用：接口不存在（404）` | 默认路径已对准官方接口；若你改过 `CLINEPASS_USAGE_PATH`，检查拼写 |
 | `📊 额度接口不可用：API Key 无效（401）` | 该 Key 已失效，重新 `/addkey` |
 | 面板只发出了一部分 | 已按 `MESSAGE_LIMIT` 自动分片，属正常 |
@@ -298,7 +299,7 @@ docker compose up -d
 ```bash
 docker compose down
 docker run --rm --user root -v clinepass-data:/app/data \
-  ghcr.io/mbaigc/clinepass-tg-bot:0.0.3 chown -R 10001:10001 /app/data
+  ghcr.io/mbaigc/clinepass-tg-bot:0.0.4 chown -R 10001:10001 /app/data
 docker compose up -d
 ```
 
@@ -311,6 +312,28 @@ docker compose exec clinepass-bot ls -ln /app/data     # 应为 10001 10001
 docker compose exec clinepass-bot cat /app/data/config.json
 docker compose cp clinepass-bot:/app/data/config.json ./config.json.bak   # 备份出来
 ```
+
+### 排查：`/addkey` 好像没生效、`/status` 又说没有 Key
+
+这种情况几乎都是**「配置文件能读、目录不能写」**：读出来当然是空的，而写入被内核拒绝了。
+0.0.4 起直接发 `/id` 就能看到答案（版本、容器名、配置文件、存储是否可写、已绑定几个）：
+
+```
+💾 存储：❌ 不可写（目录 /app/data 不可写：[Errno 13] Permission denied）
+```
+
+升级前也可以手工四连：
+
+```bash
+docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}'    # ① 有没有两个容器在抢同一个 Token
+docker compose exec clinepass-bot ls -ln /app/data          # ② 属主不是 10001 → 权限问题
+docker compose exec clinepass-bot cat /app/data/config.json # ③ 里面没有你的用户 ID → 写没落地
+docker compose logs --tail 100 | grep -iE "addkey|permission|traceback|conflict"
+```
+
+- ② 的属主不对 → 按上面「挂载与权限」`chown` 一下即可。
+- ① 出现两个同名 bot 容器 → 它们在轮流抢 Telegram 的 updates，`/addkey` 与 `/status` 可能落在不同实例，自然写到不同卷。
+- 日志里能看到每次 `/addkey` 收到的参数个数、别名与保存结果（API Key 永远不会写进日志）。
 
 ## 与旧版本的差异
 
@@ -325,6 +348,7 @@ docker compose cp clinepass-bot:/app/data/config.json ./config.json.bak   # 备�
 
 | 版本 | 说明 |
 | --- | --- |
+| **0.0.4** | 加诊断：`/id` 显示版本/容器名/配置文件/存储可写性/已绑定数量；启动时做写入探针；`/addkey`、`/delkey`、`/clear` 每次都有 INFO 日志（Key 绝不入日志）；未捕获异常会回一条带异常名的提示 |
 | **0.0.3** | `/addkey` 约定「最后一个参数是 Key，其余拼成别名」，带空格的别名（`Codex 备用`）不再是坑；别名规则与报错文案写清楚（`Cline-01` 一直合法） |
 | **0.0.2** | 修复：挂载目录不可写时 `tempfile.mkstemp` 抛出的 `PermissionError` 会漏出，导致进程崩在启动阶段；现在统一转成带修复指引的 `ConfigError`，Bot 降级运行并在日志/聊天里说明原因 |
 | 0.0.1 | 首个版本：官方额度接口、多 Key 面板、Docker 镜像与 GHCR 发布 |

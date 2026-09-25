@@ -510,6 +510,43 @@ class TestRender(unittest.TestCase):
         self.assertTrue(all(len(c) <= 800 for c in chunks))
 
 
+# ==================== 存储自检 ====================
+class TestSelfCheck(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "config.json")
+        self.store = core.ConfigStore(self.path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_writable_dir_is_ok(self):
+        ok, detail = self.store.self_check()
+        self.assertTrue(ok, detail)
+        self.assertIn("可写", detail)
+
+    def test_probe_leaves_no_files(self):
+        self.store.self_check()
+        self.assertEqual(os.listdir(self.tmp.name), [])
+
+    def test_unwritable_dir_reports_false(self):
+        from unittest import mock
+
+        with mock.patch.object(core.tempfile, "mkstemp", side_effect=PermissionError(13, "denied")):
+            ok, detail = self.store.self_check()
+        self.assertFalse(ok)
+        self.assertIn("不可写", detail)
+
+    def test_directory_path_reports_false(self):
+        ok, _ = core.ConfigStore(self.tmp.name).self_check()
+        self.assertFalse(ok)
+
+    def test_add_returns_key_count(self):
+        self.assertEqual(self.store.add(1, "a", "sk_123456789"), 1)
+        self.assertEqual(self.store.add(1, "b", "sk_123456789"), 2)
+        self.assertEqual(self.store.add(1, "a", "sk_987654321"), 2)
+
+
 # ==================== 版本 ====================
 class TestVersion(unittest.TestCase):
     def test_version_is_semver(self):

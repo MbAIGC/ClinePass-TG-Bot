@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 import sys
 
 from telegram import BotCommand, Update
@@ -73,6 +74,16 @@ class BotContext:
 
 def ctx_of(context: ContextTypes.DEFAULT_TYPE) -> BotContext:
     return context.application.bot_data["ctx"]
+
+
+def _safe_args(args: object) -> str:
+    """日志里描述命令参数，但绝不把 API Key 写进去。"""
+    tokens = [str(a) for a in (args or [])]  # type: ignore[union-attr]
+    shown = [
+        tok if len(tok) <= 16 and not tok.lower().startswith(("sk_", "sk-")) else f"<{len(tok)}字符>"
+        for tok in tokens
+    ]
+    return f"共 {len(tokens)} 个 {shown}"
 
 
 # ==================== 通用守卫 ====================
@@ -137,16 +148,38 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """不只是给 ID，还顺手把「我到底在哪个容器、写哪个文件」讲清楚。
+
+    排查「/addkey 说保存了但 /status 看不到」时，最需要的就是这几行：
+    容器名（有没有两个实例在抢同一个 Token）和配置文件路径。
+    """
     if not await _guard(update, context, private=False):
         return
+    ctx = ctx_of(context)
     user, chat = update.effective_user, update.effective_chat
     lines = [f"🆔 用户 ID：<code>{user.id}</code>" if user else "🆔 用户 ID：未知"]
     if chat:
         lines.append(f"💬 会话 ID：<code>{chat.id}</code>（{chat.type}）")
-    await update.effective_message.reply_text(  # type: ignore[union-attr]
-        "\n".join(lines) + "\n\n把用户 ID 填进 <code>ALLOWED_USER_IDS</code> 即可启用白名单。",
-        parse_mode=ParseMode.HTML,
-    )
+    lines.append(f"🤖 版本：<code>v{__version__}</code>　🏠 容器：<code>{esc(socket.gethostname())}</code>")
+    lines.append(f"🗂 配置文件：<code>{esc(ctx.settings.config_file)}</code>")
+
+    ok, detail = ctx.store.self_check()
+    lines.append(f"💾 存储：{'✅ 可读写' if ok else '❌ 不可写'}（{esc(detail[:200])}）")
+
+    if user:
+        try:
+            keys = ctx.store.keys(user.id)
+        except ConfigError as exc:
+            lines.append(f"🔑 已绑定：读取失败 <code>{esc(str(exc)[:160])}</code>")
+        else:
+            if keys:
+                names = "、".join(esc(a) for a in keys)
+                lines.append(f"🔑 已绑定：{len(keys)} 个（{names}）")
+            else:
+                lines.append("🔑 已绑定：0 个")
+    lines.append("")
+    lines.append("把用户 ID 填进 <code>ALLOWED_USER_IDS</code> 即可启用白名单。")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
 
 
 async def keys_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -190,8 +223,10 @@ async def addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         log.warning("撤回含 Key 的消息失败：%s", exc)
 
     args = context.args or []
+    log.info("收到 /addkey：user=%s，%s", user_id, _safe_args(args))
     alias, api_key = split_alias_and_key(args)
     if not api_key:
+        log.warning("addkey 参数不足：user=%s，%s", user_id, _safe_args(args))
         await say(
             "⚠️ 参数不完整。\n"
             "格式：<code>/addkey &lt;别名&gt; &lt;API_KEY&gt;</code>\n"
@@ -201,6 +236,7 @@ async def addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if alias is None:
+        log.warning("addkey 别名不合法：user=%s，%s", user_id, _safe_args(args))
         await say(
             "⚠️ 别名不合法：1–24 个字符，以中英文、数字或下划线开头，"
             "之后可含空格、点、连字符"
@@ -209,20 +245,23 @@ async def addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
     if len(api_key) < 8 or any(ch.isspace() for ch in api_key):
+        log.warning("addkey 的 Key 看起来不合法：user=%s，长度=%d", user_id, len(api_key))
         await say("⚠️ API Key 看起来不合法（长度需 ≥ 8 且不含空白字符）。")
         return
 
     try:
         async with ctx.lock_for(user_id):
-            await asyncio.to_thread(ctx.store.add, user_id, alias, api_key)
+            total = await asyncio.to_thread(ctx.store.add, user_id, alias, api_key)
     except KeyLimitError as exc:
+        log.warning("addkey 超出上限：user=%s，%s", user_id, exc)
         await say(f"⚠️ {esc(str(exc))}")
         return
     except ConfigError as exc:
-        log.error("写入配置失败：%s", exc)
+        log.error("写入配置失败：user=%s，%s", user_id, exc)
         await say("❌ 保存失败，Key <b>没有</b>被记录。\n" f"原因：<code>{esc(str(exc)[:300])}</code>")
         return
 
+    log.info("已保存 Key：user=%s，别名=%r，该用户现有 %s 个", user_id, alias, total)
     note = "（含 Key 的消息已撤回）" if deleted else "（⚠️ 未能撤回原消息，建议自行删除）"
     await say(
         f"✅ 已保存 Key\n📌 别名：<code>{esc(alias)}</code>\n"
@@ -245,8 +284,10 @@ async def delkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         async with ctx.lock_for(update.effective_user.id):  # type: ignore[union-attr]
             removed = await asyncio.to_thread(ctx.store.delete, update.effective_user.id, alias)  # type: ignore[union-attr]
     except ConfigError as exc:
+        log.error("删除失败：%s", exc)
         await update.effective_message.reply_text(f"❌ 删除失败：<code>{esc(str(exc)[:200])}</code>", parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
         return
+    log.info("删除别名：user=%s，别名=%r，结果=%s", update.effective_user.id, alias, removed)  # type: ignore[union-attr]
     text = f"🗑️ 已删除别名 <b>{esc(alias)}</b>。" if removed else f"❌ 未找到别名 <b>{esc(alias)}</b>。"
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
 
@@ -265,8 +306,10 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         async with ctx.lock_for(update.effective_user.id):  # type: ignore[union-attr]
             removed = await asyncio.to_thread(ctx.store.clear, update.effective_user.id)  # type: ignore[union-attr]
     except ConfigError as exc:
+        log.error("清空失败：%s", exc)
         await update.effective_message.reply_text(f"❌ 操作失败：<code>{esc(str(exc)[:200])}</code>", parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
         return
+    log.info("清空 Key：user=%s，删除 %s 个", update.effective_user.id, removed)  # type: ignore[union-attr]
     await update.effective_message.reply_text(f"🧹 已清空 {removed} 个 Key。", parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
 
 
@@ -315,8 +358,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("处理更新时发生未捕获异常", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
+        name = type(context.error).__name__ if context.error else "Unknown"
         try:
-            await update.effective_message.reply_text("😵 处理时出错了，请稍后再试或联系管理员查看日志。")
+            await update.effective_message.reply_text(
+                f"😵 处理时出错了（<code>{esc(name)}</code>）。\n"
+                "如果这是 /addkey 报的，多半是配置存储写不进去——先用 /id 看一眼存储状态，"
+                "再把 <code>docker logs</code> 里的 traceback 发给管理员。",
+                parse_mode=ParseMode.HTML,
+            )
         except TelegramError:
             pass
 
@@ -356,13 +405,19 @@ def main() -> int:
     setup_logging()
     settings = Settings.from_env()
 
+    store = ConfigStore(settings.config_file, settings.max_keys_per_user)
     try:
-        ConfigStore(settings.config_file, settings.max_keys_per_user).load()
-        log.info("配置存储就绪：%s", settings.config_file)
+        store.load()
     except ConfigError as exc:
         log.critical("配置存储不可用：%s", exc)
     except OSError as exc:  # 兜底：宁可降级运行，也不要崩成 restart 循环
         log.critical("配置存储初始化失败：%s", exc)
+    else:
+        ok, detail = store.self_check()
+        if ok:
+            log.info("配置存储就绪：%s（%s）", settings.config_file, detail)
+        else:
+            log.critical("配置存储不可写，/addkey 一定不会生效：%s", detail)
 
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     if not token or token == "YOUR_TELEGRAM_BOT_TOKEN":
