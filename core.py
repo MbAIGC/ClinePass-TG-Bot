@@ -28,7 +28,7 @@ import requests
 log = logging.getLogger("clinepass.core")
 
 # 版本号（单一来源：bot 启动日志、/help、面板标题都取这里）
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 
 #: 日志里必须抹掉的两个东西：Telegram Bot Token（藏在 httpx 的 URL 里、也藏在
 #: PTB 异常消息里）和 ClinePass API Key
@@ -309,7 +309,37 @@ class ConfigStore:
         keys = data.get("user_keys")
         if not isinstance(keys, dict):
             data["user_keys"] = {}
+        elif self._clean_stored_keys(data):
+            self.save(data)
         return data
+
+    @staticmethod
+    def _clean_stored_keys(data: dict) -> bool:
+        """清洗老版本存下来的 Key。
+
+        0.0.5 起才会在绑定时去掉不可见字符，之前存进去的 Key 可能夹着 U+200B 之类，
+        肉眼完全正常、打开 config.json 也看不出，但服务端只会回 401。
+        加载时统一过一遍，有改动就落盘。
+        """
+        changed = False
+        for user_id, user_keys in list(data.get("user_keys", {}).items()):
+            if not isinstance(user_keys, dict):
+                continue
+            for alias, key in list(user_keys.items()):
+                if not isinstance(key, str):
+                    continue
+                cleaned, fixed = normalize_api_key(key)
+                if fixed and cleaned:
+                    log.warning(
+                        "存储的 Key 含不可见字符，已自动清理：user=%s 别名=%r（长度 %d → %d）",
+                        user_id,
+                        alias,
+                        len(key),
+                        len(cleaned),
+                    )
+                    user_keys[alias] = cleaned
+                    changed = True
+        return changed
 
     def save(self, data: dict) -> None:
         """原子写入 + 收紧权限（Key 是敏感信息）。
@@ -556,17 +586,29 @@ def mask_key(api_key: str, show_length: bool = False) -> str:
 #: 实测有效的 Cline API Key 是 67 个字符（`sk_` + 64）；短得离谱基本都是没复制全
 TYPICAL_KEY_LENGTH = 67
 _MIN_PLAUSIBLE_KEY_LENGTH = 50
+_MAX_PLAUSIBLE_KEY_LENGTH = 80
 
 
 def key_shape_note(api_key: str) -> str:
-    """Key 长度明显不对时给一句提醒（Cline 的 401 不区分"截断"与"已失效"）。"""
-    length = len((api_key or "").strip())
+    """Key 形态明显不对时给一句提醒（Cline 的 401 不区分"截断"与"已失效"）。"""
+    key = (api_key or "").strip()
+    length = len(key)
     if length == 0:
         return "⚠️ 当前 Key 是空的，请重新 /addkey 绑定。"
+    # Key 一定是纯 ASCII：混进中文标点/全角字符多半是多复制了东西
+    odd = sorted({ch for ch in key if ord(ch) > 127})
+    if odd:
+        shown = "、".join(f"{ch} (U+{ord(ch):04X})" for ch in odd[:5])
+        return f"⚠️ Key 里混进了非 ASCII 字符：{shown}，多半是多复制了标点或中文，请重新复制。"
     if length < _MIN_PLAUSIBLE_KEY_LENGTH:
         return (
             f"⚠️ 当前 Key 只有 {length} 个字符（Cline 的 Key 通常是 {TYPICAL_KEY_LENGTH} 个），"
             "很可能复制时漏了尾巴，请重新复制完整 Key 再 /addkey。"
+        )
+    if length > _MAX_PLAUSIBLE_KEY_LENGTH:
+        return (
+            f"⚠️ 当前 Key 有 {length} 个字符（Cline 的 Key 通常是 {TYPICAL_KEY_LENGTH} 个），"
+            "可能多复制了内容，请只保留 sk_ 开头的那一串。"
         )
     return ""
 

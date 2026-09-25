@@ -180,6 +180,33 @@ class TestConfigStore(unittest.TestCase):
         self.path = os.path.join(self.tmp.name, "config.json")
         self.store = ConfigStore(self.path, max_keys_per_user=3)
 
+    def test_load_cleans_invisible_chars_in_stored_keys(self):
+        """0.0.5 之前绑定的 Key 可能夹着零宽字符，加载时要自动清掉并落盘。"""
+        dirty = "sk_abc\u200bdef\ufeffghi"
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "user_keys": {"42": {"主账号": dirty}}}, fh)
+        data = self.store.load()
+        self.assertEqual(data["user_keys"]["42"]["主账号"], "sk_abcdefghi")
+        with open(self.path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["user_keys"]["42"]["主账号"], "sk_abcdefghi")
+
+    def test_load_keeps_clean_keys_untouched(self):
+        key = "sk_" + "a" * 64
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "user_keys": {"42": {"主账号": key}}}, fh)
+        stamp = os.path.getmtime(self.path) - 10
+        os.utime(self.path, (stamp, stamp))
+        data = self.store.load()
+        self.assertEqual(data["user_keys"]["42"]["主账号"], key)
+        self.assertEqual(os.path.getmtime(self.path), stamp)  # 没动过文件
+
+    def test_load_survives_weird_user_keys_shape(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "user_keys": {"42": "not-a-dict", "43": {"a": 123}}}, fh)
+        data = self.store.load()
+        self.assertEqual(data["user_keys"]["42"], "not-a-dict")
+        self.assertEqual(data["user_keys"]["43"], {"a": 123})
+
     def test_creates_file_on_first_load(self):
         data = self.store.load()
         self.assertEqual(data["user_keys"], {})
@@ -586,6 +613,21 @@ class TestKeyMaskAndShape(unittest.TestCase):
         note = core.key_shape_note("sk_05b052fdfgdfgdfgfdg")  # 22 位，明显是截断的
         self.assertIn("22 个字符", note)
         self.assertIn(str(core.TYPICAL_KEY_LENGTH), note)
+
+    def test_shape_note_flags_non_ascii(self):
+        """多复制了一个中文句号 —— 长度看着正常，服务端照样 401。"""
+        note = core.key_shape_note("sk_" + "a" * 63 + "。")
+        self.assertIn("非 ASCII", note)
+        self.assertIn("U+3002", note)
+
+    def test_shape_note_flags_overlong_key(self):
+        note = core.key_shape_note("sk_" + "a" * 100)
+        self.assertIn("多复制", note)
+
+    def test_shape_note_has_no_html(self):
+        """这条提示会被 esc() 转义，不能自带标签。"""
+        for key in ("", "sk_short", "sk_" + "a" * 100, "sk_" + "a" * 63 + "。"):
+            self.assertNotIn("<", core.key_shape_note(key))
 
     def test_shape_note_silent_for_plausible_lengths(self):
         self.assertEqual(core.key_shape_note("sk_" + "a" * 59), "")
