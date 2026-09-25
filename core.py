@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -28,7 +29,7 @@ import requests
 log = logging.getLogger("clinepass.core")
 
 # 版本号（单一来源：bot 启动日志、/help、面板标题都取这里）
-__version__ = "0.0.8"
+__version__ = "0.0.9"
 
 #: 日志里必须抹掉的两个东西：Telegram Bot Token（藏在 httpx 的 URL 里、也藏在
 #: PTB 异常消息里）和 ClinePass API Key
@@ -583,6 +584,16 @@ def mask_key(api_key: str, show_length: bool = False) -> str:
     return masked
 
 
+def key_fingerprint(api_key: str) -> str:
+    """Key 的 SHA-256 前 12 位，用来和用户手里的 Key 对账。
+
+    服务端对"截断的 Key"和"已失效的 Key"回一模一样的 401，光看掩码分不清，
+    但让用户本地 `printf '%s' 'Key' | sha256sum` 比一下指纹就能确定存进来的是不是同一串。
+    12 位十六进制（48 bit）不足以反推 256 bit 的密钥，可以安全展示。
+    """
+    return hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:12]
+
+
 #: 实测有效的 Cline API Key 是 67 个字符（`sk_` + 64）；短得离谱基本都是没复制全
 TYPICAL_KEY_LENGTH = 67
 _MIN_PLAUSIBLE_KEY_LENGTH = 50
@@ -981,20 +992,46 @@ class ClinePassClient:
         data = payload.get("data")
         return data if isinstance(data, dict) else payload
 
+    def _auth_lines(self, rejected: list[tuple[str, str, ApiError]], api_key: str) -> list[str]:
+        """401/403 时把话说全：哪个接口拒的、Cline 的原话、Key 指纹与长度。
+
+        服务端对"截断的 Key"和"已失效的 Key"回一模一样的 401，
+        所以必须靠指纹 + 长度和用户手里那把 Key 对账。
+        """
+        names = "、".join(f"{label}（{path}）" for label, path, _ in rejected)
+        err = rejected[-1][2]
+        status = err.status or 401
+        detail = " ".join(str(err.detail).split())[:160] or "（Cline 没给内容）"
+        length = len((api_key or "").strip())
+        if length == TYPICAL_KEY_LENGTH:
+            shape = f"{length} 字符（长度与实测可用的 Key 一致）"
+        else:
+            shape = f"{length} 字符（实测可用的 Key 是 {TYPICAL_KEY_LENGTH} 字符，少/多一位最常见的原因就是复制漏字或多字）"
+        lines = [
+            f"🔒 Cline 拒绝了这把 Key：{names} 返回 {status}",
+            f"Cline 原话：{detail}",
+            f"Key 指纹 {key_fingerprint(api_key)} · {shape}",
+        ]
+        note = key_shape_note(api_key)
+        if note:
+            lines.append(note)
+        lines.append(
+            "🔍 对账办法：本地执行 printf '%s' '你的Key' | sha256sum，前 12 位应与上面指纹一致；"
+            "不一致就说明存进 Bot 的和你的 Key 不是同一串，重新 /addkey 即可。"
+        )
+        return lines
+
     def fetch_snapshot_sync(self, alias: str, api_key: str) -> Snapshot:
         snapshot = Snapshot(alias=alias, key_mask=mask_key(api_key, show_length=True))
+        rejected: list[tuple[str, str, ApiError]] = []
 
         try:
             snapshot.account = dict(self._unwrap(self.get_json(ACCOUNT_PATH, api_key)))
         except ApiError as exc:
             if exc.kind in {"unauthorized", "forbidden"}:
-                snapshot.warnings.append(f"🔒 {exc.friendly}")
-                # 401 是最常见的求助场景：顺手把"Key 是不是没复制全"也说了
-                note = key_shape_note(api_key)
-                if note:
-                    snapshot.warnings.append(note)
-                return snapshot
-            snapshot.warnings.append(f"👤 账号信息获取失败：{exc.friendly}")
+                rejected.append(("账号接口", ACCOUNT_PATH, exc))
+            else:
+                snapshot.warnings.append(f"👤 账号信息获取失败：{exc.friendly}")
 
         try:
             plan_data = self._unwrap(self.get_json(PLAN_PATH, api_key))
@@ -1005,7 +1042,10 @@ class ClinePassClient:
                 "end": plan_data.get("currentPeriodEnd"),
             }
         except ApiError as exc:
-            snapshot.warnings.append(f"💳 套餐信息获取失败：{exc.friendly}")
+            if exc.kind in {"unauthorized", "forbidden"}:
+                rejected.append(("套餐接口", PLAN_PATH, exc))
+            else:
+                snapshot.warnings.append(f"💳 套餐信息获取失败：{exc.friendly}")
 
         if self.settings.demo_mode:
             snapshot.windows = [
@@ -1016,16 +1056,24 @@ class ClinePassClient:
             snapshot.warnings.append("🧪 DEMO_MODE 已开启，额度为示例数据")
             return snapshot
 
+        # 账号接口 401 也要继续试额度接口：不同路由的鉴权并不总是一致，
+        # 而且"到底哪个接口拒的"正是排查时最需要的信息。
         try:
             payload = self.get_json(self.settings.usage_path, api_key)
         except ApiError as exc:
-            snapshot.warnings.append(f"📊 额度接口不可用：{exc.friendly}")
+            if exc.kind in {"unauthorized", "forbidden"}:
+                rejected.append(("额度接口", self.settings.usage_path, exc))
+            else:
+                snapshot.warnings.append(f"📊 额度接口不可用：{exc.friendly}")
         else:
             windows = parse_usage(payload)
             if windows:
                 snapshot.windows = windows
             else:
                 snapshot.warnings.append("📊 额度接口已响应，但未包含可识别的额度字段")
+
+        for line in reversed(self._auth_lines(rejected, api_key) if rejected else []):
+            snapshot.warnings.insert(0, line)
 
         return snapshot
 

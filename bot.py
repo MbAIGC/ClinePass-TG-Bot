@@ -38,6 +38,7 @@ from core import (
     Settings,
     __version__,
     esc,
+    key_fingerprint,
     key_shape_note,
     mask_key,
     normalize_api_key,
@@ -229,9 +230,14 @@ async def keys_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
     lines = ["📋 <b>已绑定的 Key</b>", ""]
-    lines.extend(f"• <b>{esc(alias)}</b>：<code>{esc(mask_key(key, show_length=True))}</code>" for alias, key in user_keys.items())
+    lines.extend(
+        f"• <b>{esc(alias)}</b>：<code>{esc(mask_key(key, show_length=True))}</code>\n"
+        f"  指纹 <code>{esc(key_fingerprint(key))}</code>"
+        for alias, key in user_keys.items()
+    )
     lines.append("")
     lines.append(f"共 {len(user_keys)} 个")
+    lines.append("🔍 指纹对账：<code>printf '%s' '你的Key' | sha256sum</code> 的前 12 位应当一致")
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
 
 
@@ -310,7 +316,8 @@ async def addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         note += "\n" + esc(shape)
     await say(
         f"✅ 已保存 Key\n📌 别名：<code>{esc(alias)}</code>\n"
-        f"🔐 Key：<code>{esc(mask_key(api_key, show_length=True))}</code>\n{note}"
+        f"🔐 Key：<code>{esc(mask_key(api_key, show_length=True))}</code>\n"
+        f"🔍 指纹 <code>{esc(key_fingerprint(api_key))}</code>\n{note}"
     )
 
 

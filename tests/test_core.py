@@ -441,13 +441,40 @@ class TestClient(unittest.TestCase):
         self.assertEqual([w.percent for w in snapshot.windows], [2.0, 57.0, 28.0])
         self.assertEqual(snapshot.warnings, [])
 
-    def test_invalid_key_short_circuits(self):
-        session = FakeSession({"/api/v1/users/me": FakeResponse(401, {"error": "Unauthorized"})})
+    def test_unauthorized_queries_every_endpoint_and_names_them(self):
+        """401 时不再短路：三个接口都试一遍，才能指出到底是谁拒的。"""
+        unauthorized = FakeResponse(401, {"error": "Unauthorized"})
+        session = FakeSession(
+            {
+                "/api/v1/users/me": unauthorized,
+                "/api/v1/users/me/plan": unauthorized,
+                "/api/v1/users/me/plan/usage-limits": unauthorized,
+            }
+        )
         snapshot = ClinePassClient(self.settings, session=session).fetch_snapshot_sync("x", "sk_bad")
         self.assertFalse(snapshot.has_usage)
-        self.assertTrue(any("401" in w for w in snapshot.warnings))
-        # 401 后不再请求其它接口
-        self.assertEqual(session.calls, ["/api/v1/users/me"])
+        self.assertEqual(
+            session.calls,
+            ["/api/v1/users/me", "/api/v1/users/me/plan", "/api/v1/users/me/plan/usage-limits"],
+        )
+        joined = "\n".join(snapshot.warnings)
+        self.assertIn("账号接口", joined)
+        self.assertIn("额度接口", joined)
+        self.assertIn("401", joined)
+
+    def test_account_401_still_reports_quota_if_usage_works(self):
+        """只有账号接口 401 时，额度该显示还得显示。"""
+        session = FakeSession(
+            {
+                "/api/v1/users/me": FakeResponse(401, {"error": "Unauthorized"}),
+                "/api/v1/users/me/plan": FakeResponse(404, {"error": "Not Found"}),
+                "/api/v1/users/me/plan/usage-limits": FakeResponse(200, REAL_LIMITS_PAYLOAD),
+            }
+        )
+        snapshot = ClinePassClient(self.settings, session=session).fetch_snapshot_sync("x", "sk_test123456")
+        self.assertTrue(snapshot.has_usage)
+        self.assertEqual([w.percent for w in snapshot.windows], [2.0, 57.0, 28.0])
+        self.assertIn("账号接口", "\n".join(snapshot.warnings))
 
     def test_invalid_key_reports_cline_message_and_shape(self):
         """Cline 的原话 + Key 长度都要带出来 —— 这是排查 401 的关键线索。"""
@@ -457,14 +484,18 @@ class TestClient(unittest.TestCase):
         snapshot = ClinePassClient(self.settings, session=session).fetch_snapshot_sync("x", "sk_shortkey12345")
         joined = "\n".join(snapshot.warnings)
         self.assertIn("re-authenticate", joined)
-        self.assertIn("16 个字符", joined)
+        self.assertIn("16 字符", joined)
+        self.assertIn(core.key_fingerprint("sk_shortkey12345"), joined)
+        self.assertIn("sha256sum", joined)
         self.assertIn("sk_s…2345", snapshot.key_mask)
 
     def test_long_invalid_key_gets_no_length_warning(self):
         key = "sk_" + "a" * 64
         session = FakeSession({"/api/v1/users/me": FakeResponse(401, {"error": "Unauthorized"})})
         snapshot = ClinePassClient(self.settings, session=session).fetch_snapshot_sync("x", key)
-        self.assertNotIn("很可能复制", "\n".join(snapshot.warnings))
+        joined = "\n".join(snapshot.warnings)
+        self.assertNotIn("很可能复制", joined)
+        self.assertIn("长度与实测可用的 Key 一致", joined)
         self.assertIn("67 字符", snapshot.key_mask)
 
     def test_missing_usage_endpoint_is_reported_not_faked(self):

@@ -1,6 +1,6 @@
 # 🤖 ClinePass TG Bot
 
-> 当前版本 **0.0.8**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
+> 当前版本 **0.0.9**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
 
 把 Cline / ClinePass 账号的用量做成 Telegram 面板：一个用户可绑定多个 API Key，`/status` 一次看全部账号。
 
@@ -224,7 +224,7 @@ Authorization: Bearer sk_xxx
 ├── .github/workflows/ci.yml  # CI：单测矩阵 → 构建镜像+冒烟 → 打标签时推 GHCR
 ├── bot.py                # Telegram 交互层：指令、鉴权、限流、错误兜底
 ├── core.py               # 核心逻辑：JSON 存储、API 客户端、面板渲染（无 PTB 依赖，可单测）
-├── tests/test_core.py    # 103 个单元测试，纯标准库
+├── tests/test_core.py    # 104 个单元测试，纯标准库
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -248,7 +248,7 @@ python3 -m unittest discover -s tests -t . -v
 
 | job | 内容 |
 | --- | --- |
-| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 103 个单元测试 |
+| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 104 个单元测试 |
 | `docker` | buildx 构建镜像（带 gha 缓存）→ 镜像内自检：能导入、非 root(10001)、命名卷可写配置、缺 Token 时退出码为 1 |
 | `publish` | 仅在 `main` 分支或 `v*` 标签上触发，推送到 GHCR（`ghcr.io/mbaigc/clinepass-tg-bot`） |
 
@@ -306,7 +306,8 @@ docker run -d --name clinepass_tg_bot --restart unless-stopped \
 | 日志里出现 `bot<TOKEN>` / `sk_<KEY>` | 这是脱敏后的样子，属正常；真 Token 不会进日志 |
 | `📊 额度接口不可用：接口不存在（404）` | 默认路径已对准官方接口；若你改过 `CLINEPASS_USAGE_PATH`，检查拼写 |
 | `🔒 API Key 无效或已过期（401）` | Cline 拒绝了这把 Key。面板会附上 Cline 的原话和 Key 长度（0.0.7+）：**长度明显短于 67 位就是没复制全**，重新复制后 `/addkey`；长度正常则是 Key 已失效/被撤销，去 Cline 重新生成 |
-| curl 用同一把 Key 是 200，Bot 里却 401 | 说明**存进 Bot 的那份和你 curl 的那份不是同一串**：要么短了（复制不全），要么夹了不可见字符。0.0.8 起加载配置时会自动清洗老数据里的不可见字符并写回；剩下的看 `/keys` 显示的长度是不是 67 |
+| curl 用同一把 Key 是 200，Bot 里却 401 | 说明**存进 Bot 的那份和你 curl 的那份不是同一串**：要么短了/多了一个字符，要么夹了不可见字符。0.0.8 起加载时自动清洗不可见字符；0.0.9 起面板会列出**是哪个接口（账号/套餐/额度）拒的**、Cline 的原话，以及 **Key 指纹**。掩码是分不出"少一位"的（`sk_7…aaaa` 删掉中间一位后长得一模一样），只有长度和指纹能 |
+| 怎么用指纹对账 | `/keys` 里每把 Key 后面都有指纹；本地跑 `printf '%s' '你的Key' | sha256sum | cut -c1-12`，两边一致就说明存进 Bot 的就是你手里那串，不一致就重新 `/addkey` |
 | 想自己确认 Key 到底行不行 | `curl -sS -i https://api.cline.bot/api/v1/users/me/plan/usage-limits -H "Authorization: Bearer sk_你的Key"`，有效时是 `HTTP/2 200` + `{"data":{"limits":[…]}}`，无效时是 401 + `Unauthorized: …re-authenticate your Cline account` |
 | 面板只发出了一部分 | 已按 `MESSAGE_LIMIT` 自动分片，属正常 |
 | `⏳ 操作太快了` | `STATUS_COOLDOWN` 限流，稍等即可 |
@@ -379,6 +380,7 @@ docker compose logs --tail 100 | grep -iE "addkey|permission|traceback|conflict"
 
 | 版本 | 说明 |
 | --- | --- |
+| **0.0.9** | 401 归因到接口：账号接口 401 不再短路，三个接口都试一遍并逐个点名（实测三把路由会同时 401，但不再假设如此）；面板给出 Key 的 SHA-256 前 12 位指纹与长度对照，方便和 `sha256sum` 对账；`/keys`、`/addkey` 回执也带指纹 |
 | **0.0.8** | 加载配置时自动清洗历史 Key 里的不可见字符并落盘（0.0.5 之前绑定的 Key 会中招：肉眼正常、长度只多一位，服务端只有 401）；Key 形态检查扩展到"混入中文标点/非 ASCII"和"长度超长疑似多复制" |
 | **0.0.7** | 401 诊断升级：面板带上 Cline 的原始报错（`Unauthorized: …re-authenticate your Cline account`）和 Key 长度（`sk_0…2df9 · 22 字符`）；短于 50 位时直接点出「很可能没复制完整」（实测有效 Key 为 67 位），`/addkey` 绑定当场就提醒；`/keys` 也显示每把 Key 的长度 |
 | **0.0.6** | 命令兜底救援：Telegram 只把「标准命令」交给我们，全角斜杠 `／addkey`、全角空格、零宽字符、被代码块包住的命令都会漏掉。现在这些文本会被自动修好并交给对应处理器执行；救不回来时回复里点名「全角空格 U+3000」这类元凶 |
