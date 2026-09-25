@@ -390,7 +390,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     notice = await message.reply_text(f"⏳ 正在查询 {len(user_keys)} 个账号…")  # type: ignore[union-attr]
     try:
         snapshots = await ctx.client.fetch_all(list(user_keys.items()))
-        chunks = split_message(render_panel(snapshots), ctx.settings.message_limit)
+        chunks = split_message(
+            render_panel(snapshots, show_identity=ctx.settings.show_identity),
+            ctx.settings.message_limit,
+        )
     finally:
         # 无论成功失败都收起"正在查询"，避免残留一条假进度
         try:

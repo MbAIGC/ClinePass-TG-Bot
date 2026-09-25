@@ -29,7 +29,7 @@ import requests
 log = logging.getLogger("clinepass.core")
 
 # 版本号（单一来源：bot 启动日志、/help、面板标题都取这里）
-__version__ = "0.0.9"
+__version__ = "0.1.0"
 
 #: 日志里必须抹掉的两个东西：Telegram Bot Token（藏在 httpx 的 URL 里、也藏在
 #: PTB 异常消息里）和 ClinePass API Key
@@ -37,6 +37,8 @@ _SECRET_PATTERNS = (
     # 带 bot 前缀的 URL 形态，以及异常消息里裸着的 123456789:AAF... 形态
     (re.compile(r"(?:bot)?\d{5,}:[A-Za-z0-9_\-]{20,}"), "bot<TOKEN>"),
     (re.compile(r"sk_[A-Za-z0-9_\-]{8,}"), "sk_<KEY>"),
+    # 账号邮箱也是敏感信息：即便不小心被打进日志，也不能明文留下
+    (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "***@***"),
 )
 
 
@@ -221,6 +223,8 @@ class Settings:
     status_cooldown: float = 5.0
     message_limit: int = MESSAGE_LIMIT
     demo_mode: bool = False
+    #: 邮箱与账号名默认**不显示**（面板与日志都不出现），需要时才用 SHOW_IDENTITY=1 打开
+    show_identity: bool = False
     allowed_user_ids: frozenset[int] = frozenset()
 
     @classmethod
@@ -239,6 +243,7 @@ class Settings:
             status_cooldown=_env_float(env, "STATUS_COOLDOWN", 5.0, 0.0, 600.0),
             message_limit=_env_int(env, "MESSAGE_LIMIT", MESSAGE_LIMIT, 500, 4096),
             demo_mode=_env_bool(env, "DEMO_MODE", False),
+            show_identity=_env_bool(env, "SHOW_IDENTITY", False),
             allowed_user_ids=_env_ids(env, "ALLOWED_USER_IDS"),
         )
 
@@ -1091,7 +1096,11 @@ class ClinePassClient:
 
 
 # ==================== 渲染 ====================
-def progress_bar(percent: float, length: int = 10) -> str:
+#: 进度条宽度（格子数）
+BAR_WIDTH = 16
+
+
+def progress_bar(percent: float, length: int = BAR_WIDTH) -> str:
     """生成进度条；percent 会被夹到 0~100。"""
     value = max(0.0, min(100.0, float(percent)))
     filled = int(round(length * value / 100))
@@ -1106,8 +1115,9 @@ def esc(value: Any) -> str:
 _esc = esc
 
 
-def _account_lines(account: Optional[Mapping[str, Any]]) -> list[str]:
-    if not account:
+def _account_lines(account: Optional[Mapping[str, Any]], show: bool = False) -> list[str]:
+    """账号邮箱与名字属于敏感信息：默认整行不显示（SHOW_IDENTITY=1 才展示）。"""
+    if not account or not show:
         return []
     name = account.get("displayName") or account.get("name")
     email = account.get("email")
@@ -1125,7 +1135,8 @@ def _plan_lines(plan: Optional[Mapping[str, Any]], period: Mapping[str, Any]) ->
         active = plan.get("isActive")
         if title:
             tail = []
-            if interval:
+            # 套餐名里往往已经带了周期，`Cline Pass (Monthly)（Monthly · ✅ 生效）` 太啰嗦
+            if interval and str(interval).lower() not in str(title).lower():
                 tail.append(_esc(interval))
             if active is not None:
                 tail.append("✅ 生效" if active else "⛔️ 已失效")
@@ -1137,12 +1148,15 @@ def _plan_lines(plan: Optional[Mapping[str, Any]], period: Mapping[str, Any]) ->
     return lines
 
 
-def render_snapshot(snapshot: Snapshot, now: Optional[datetime] = None) -> str:
+def render_snapshot(
+    snapshot: Snapshot, now: Optional[datetime] = None, show_identity: bool = False
+) -> str:
     """把单个别名渲染成一段 HTML 消息。"""
     lines = [f"🔑 <b>账号/别名：{_esc(snapshot.alias)}</b>  <code>{_esc(snapshot.key_mask)}</code>"]
-    lines.extend(_account_lines(snapshot.account))
+    lines.extend(_account_lines(snapshot.account, show=show_identity))
     lines.extend(_plan_lines(snapshot.plan, snapshot.plan_period))
 
+    quota: list[str] = []
     if snapshot.windows:
         for window in snapshot.windows:
             badge = f" {window.warning}" if window.warning else ""
@@ -1160,22 +1174,32 @@ def render_snapshot(snapshot: Snapshot, now: Optional[datetime] = None) -> str:
                 details.append(f"重置：{_esc(reset)}")
             if details:
                 block.append("  ".join(details))
-            lines.append("\n".join(block))
+            quota.append("\n".join(block))
     else:
-        lines.append("📊 <b>额度</b>：暂无可显示的额度数据")
+        quota.append("📊 <b>额度</b>：暂无可显示的额度数据")
 
-    for warning in snapshot.warnings:
-        lines.append(_esc(warning))
+    # 每块额度（以及后面的提示）前面空一行，别挤成一坨
+    for item in quota:
+        lines.append("")
+        lines.append(item)
 
+    if snapshot.warnings:
+        lines.append("")
+        lines.extend(_esc(warning) for warning in snapshot.warnings)
+
+    while lines and not lines[0]:
+        lines.pop(0)
     return "\n".join(lines)
 
 
-def render_panel(snapshots: Sequence[Snapshot], now: Optional[datetime] = None) -> str:
+def render_panel(
+    snapshots: Sequence[Snapshot], now: Optional[datetime] = None, show_identity: bool = False
+) -> str:
     """渲染整块面板（不含分片）。"""
     moment = now or datetime.now(timezone.utc)
     stamp = moment.astimezone().strftime("%H:%M:%S")
     sections = [f"🤖 <b>ClinePass Status Panel</b> · v{__version__}"]
-    sections.extend(render_snapshot(s, moment) for s in snapshots)
+    sections.extend(render_snapshot(s, moment, show_identity=show_identity) for s in snapshots)
     sections.append(f"🔄 <b>更新时间</b> {_esc(stamp)}")
     return f"\n\n{SECTION_SEP}\n\n".join(sections)
 

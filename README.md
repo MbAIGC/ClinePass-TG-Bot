@@ -1,32 +1,37 @@
 # 🤖 ClinePass TG Bot
 
-> 当前版本 **0.0.9**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
+> 当前版本 **0.1.0**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
 
 把 Cline / ClinePass 账号的用量做成 Telegram 面板：一个用户可绑定多个 API Key，`/status` 一次看全部账号。
 
 ```
-🤖 ClinePass Status Panel
+🤖 ClinePass Status Panel · v0.1.0
 
 ───────────────
 
-🔑 账号/别名：主账号  sk_7f2a…9c41
-👤 w***@gmail.com · Wang Jays
-💳 Cline Pass (Monthly)（Monthly · ✅ 生效）
+🔑 账号/别名：主账号  sk_7f2a…9c41 · 67 字符
+💳 Cline Pass (Monthly)（✅ 生效）
 📆 计费周期：2026-09-23 → 2026-10-23
+
 📊 5 小时额度（已用）
-░░░░░░░░░░ 2% · 剩余 98%
+░░░░░░░░░░░░░░░░ 2% · 剩余 98%
 重置：09-25 22:32（还有 4 小时 12 分）
+
 📊 本周额度（已用）
-██████░░░░ 57% · 剩余 43%
+█████████░░░░░░░ 57% · 剩余 43%
 重置：09-30 20:08（还有 5 天 1 小时）
+
 📊 本月额度（已用）
-███░░░░░░░ 28% · 剩余 72%
+████░░░░░░░░░░░░ 28% · 剩余 72%
 重置：10-23 20:08（还有 28 天 1 小时）
 
 ───────────────
 
 🔄 更新时间 18:20:11
 ```
+
+> 🔒 面板默认**不显示**账号邮箱与名字（敏感信息，后台日志里也不会出现）；
+> 确实需要时用 `SHOW_IDENTITY=1` 打开。
 
 ## 功能
 
@@ -120,6 +125,7 @@ python bot.py
 | `MESSAGE_LIMIT` | `3800` | 单条消息最大长度，超长自动分片 |
 | `ALLOWED_USER_IDS` | 空 | 白名单，逗号分隔；留空 = 所有人可用 |
 | `DEMO_MODE` | `0` | `1` = 用示例数字渲染（截图/开发用，面板会标注） |
+| `SHOW_IDENTITY` | `0` | `1` = 在面板里显示账号邮箱与名字；默认不显示（敏感信息，日志同样脱敏） |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 | `CONFIG_FILE` | 脚本同目录 `config.json` | 配置文件路径（容器里为 `/app/data/config.json`） |
 
@@ -224,7 +230,7 @@ Authorization: Bearer sk_xxx
 ├── .github/workflows/ci.yml  # CI：单测矩阵 → 构建镜像+冒烟 → 打标签时推 GHCR
 ├── bot.py                # Telegram 交互层：指令、鉴权、限流、错误兜底
 ├── core.py               # 核心逻辑：JSON 存储、API 客户端、面板渲染（无 PTB 依赖，可单测）
-├── tests/test_core.py    # 104 个单元测试，纯标准库
+├── tests/test_core.py    # 112 个单元测试，纯标准库
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -248,7 +254,7 @@ python3 -m unittest discover -s tests -t . -v
 
 | job | 内容 |
 | --- | --- |
-| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 104 个单元测试 |
+| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 112 个单元测试 |
 | `docker` | buildx 构建镜像（带 gha 缓存）→ 镜像内自检：能导入、非 root(10001)、命名卷可写配置、缺 Token 时退出码为 1 |
 | `publish` | 仅在 `main` 分支或 `v*` 标签上触发，推送到 GHCR（`ghcr.io/mbaigc/clinepass-tg-bot`） |
 
@@ -380,6 +386,7 @@ docker compose logs --tail 100 | grep -iE "addkey|permission|traceback|conflict"
 
 | 版本 | 说明 |
 | --- | --- |
+| **0.1.0** | 面板改版：邮箱与账号名默认不显示（并在日志脱敏里加了邮箱规则）；套餐周期与套餐名重复时不再重复（`Cline Pass (Monthly)（✅ 生效）`）；计费周期后、每个额度块前各空一行；进度条从 10 格拉长到 16 格（`core.BAR_WIDTH`） |
 | **0.0.9** | 401 归因到接口：账号接口 401 不再短路，三个接口都试一遍并逐个点名（实测三把路由会同时 401，但不再假设如此）；面板给出 Key 的 SHA-256 前 12 位指纹与长度对照，方便和 `sha256sum` 对账；`/keys`、`/addkey` 回执也带指纹 |
 | **0.0.8** | 加载配置时自动清洗历史 Key 里的不可见字符并落盘（0.0.5 之前绑定的 Key 会中招：肉眼正常、长度只多一位，服务端只有 401）；Key 形态检查扩展到"混入中文标点/非 ASCII"和"长度超长疑似多复制" |
 | **0.0.7** | 401 诊断升级：面板带上 Cline 的原始报错（`Unauthorized: …re-authenticate your Cline account`）和 Key 长度（`sk_0…2df9 · 22 字符`）；短于 50 位时直接点出「很可能没复制完整」（实测有效 Key 为 67 位），`/addkey` 绑定当场就提醒；`/keys` 也显示每把 Key 的长度 |

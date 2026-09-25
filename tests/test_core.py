@@ -101,12 +101,23 @@ def settings_for(tmp: str, **kwargs) -> Settings:
 # ==================== 渲染工具 ====================
 class TestHelpers(unittest.TestCase):
     def test_progress_bar_edges(self):
-        self.assertEqual(progress_bar(0), "░" * 10)
-        self.assertEqual(progress_bar(100), "█" * 10)
-        self.assertEqual(progress_bar(-5), "░" * 10)
-        self.assertEqual(progress_bar(1000), "█" * 10)
-        self.assertEqual(len(progress_bar(63)), 10)
+        width = core.BAR_WIDTH
+        self.assertEqual(progress_bar(0), "░" * width)
+        self.assertEqual(progress_bar(100), "█" * width)
+        self.assertEqual(progress_bar(-5), "░" * width)
+        self.assertEqual(progress_bar(1000), "█" * width)
+        self.assertEqual(len(progress_bar(63)), width)
         self.assertEqual(progress_bar(50, 4), "██░░")
+
+    def test_progress_bar_is_longer_than_before(self):
+        """用户反馈进度条太短，已从 10 格拉到 16 格。"""
+        self.assertGreaterEqual(core.BAR_WIDTH, 16)
+
+    def test_show_identity_defaults_to_off(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(settings_for(tmp).show_identity)
+            self.assertTrue(settings_for(tmp, show_identity=True).show_identity)
 
     def test_mask_key(self):
         self.assertEqual(mask_key("sk_1234567890"), "sk_1…7890")
@@ -562,11 +573,74 @@ class TestRender(unittest.TestCase):
             account={"email": "<b>x</b>@y.z"},
             windows=[Window("5 小时额度", 63.0, "1h 52m", "18:32")],
         )
-        text = render_panel([snapshot], now=datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc))
+        moment = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        text = render_panel([snapshot], now=moment, show_identity=True)
         self.assertNotIn("<script>", text)
         self.assertIn("&lt;script&gt;", text)
         self.assertIn("&lt;b&gt;x&lt;/b&gt;@y.z", text)
         self.assertRegex(text, r"更新时间</b> \d{2}:\d{2}:\d{2}")
+
+    def test_email_and_name_are_not_shown_by_default(self):
+        """邮箱与账号名是敏感信息：默认面板里一个字都不出现。"""
+        snapshot = Snapshot(
+            alias="主账号",
+            key_mask="sk_7…aaaa · 67 字符",
+            account={"email": "someone@example.com", "displayName": "Wang Jays"},
+            windows=[Window("本周额度", 58.0)],
+        )
+        text = render_panel([snapshot])
+        self.assertNotIn("someone@example.com", text)
+        self.assertNotIn("Wang", text)
+        self.assertNotIn("👤", text)
+
+    def test_identity_shown_only_when_asked(self):
+        snapshot = Snapshot(
+            alias="主账号",
+            key_mask="sk_7…aaaa · 67 字符",
+            account={"email": "someone@example.com", "displayName": "Wang Jays"},
+        )
+        text = render_panel([snapshot], show_identity=True)
+        self.assertIn("someone@example.com", text)
+        self.assertIn("Wang Jays", text)
+
+    def test_plan_interval_is_not_repeated(self):
+        """`Cline Pass (Monthly)（Monthly · ✅ 生效）` 里的重复周期要去掉。"""
+        snapshot = Snapshot(
+            alias="主账号",
+            key_mask="sk_1…7890",
+            plan={"displayName": "Cline Pass (Monthly)", "interval": "Monthly", "isActive": True},
+        )
+        text = render_snapshot(snapshot)
+        self.assertIn("Cline Pass (Monthly)（✅ 生效）", text)
+        self.assertNotIn("Monthly · ✅", text)
+
+    def test_plan_interval_kept_when_not_in_the_name(self):
+        snapshot = Snapshot(
+            alias="主账号",
+            key_mask="sk_1…7890",
+            plan={"displayName": "Cline Pass", "interval": "Monthly", "isActive": True},
+        )
+        self.assertIn("Cline Pass（Monthly · ✅ 生效）", render_snapshot(snapshot))
+
+    def test_quota_blocks_are_separated_by_blank_lines(self):
+        snapshot = Snapshot(
+            alias="主账号",
+            key_mask="sk_1…7890",
+            plan={"displayName": "Cline Pass", "interval": "Monthly", "isActive": True},
+            plan_period={"start": "2026-09-23T00:00:00Z", "end": "2026-10-23T00:00:00Z"},
+            windows=[Window("5 小时额度", 5.0), Window("本周额度", 58.0), Window("本月额度", 29.0)],
+        )
+        lines = render_snapshot(snapshot).split("\n")
+        for index, line in enumerate(lines):
+            if line.startswith("📊"):
+                self.assertEqual(lines[index - 1], "", f"{line} 上面应该有且只有一个空行")
+        # 计费周期下面也要空一行（第一条额度块之前）
+        period = next(i for i, line in enumerate(lines) if line.startswith("📆"))
+        self.assertEqual(lines[period + 1], "")
+
+    def test_no_leading_blank_line_when_identity_hidden(self):
+        snapshot = Snapshot(alias="x", key_mask="sk_1…7890", windows=[Window("本周额度", 1.0)])
+        self.assertFalse(render_snapshot(snapshot).startswith("\n"))
 
     def test_alias_with_markdown_chars_is_rendered_literally(self):
         snapshot = Snapshot(alias="a_b*c", key_mask="sk_1…7890", windows=[Window("本周额度", 50.0)])
@@ -795,6 +869,11 @@ class TestRedaction(unittest.TestCase):
     def test_plain_text_is_untouched(self):
         self.assertEqual(core.redact("普通日志 123"), "普通日志 123")
         self.assertEqual(core.redact(""), "")
+
+    def test_email_is_redacted(self):
+        out = core.redact("账号 someone@example.com 订阅到期")
+        self.assertNotIn("someone@example.com", out)
+        self.assertIn("***@***", out)
 
     def test_bare_token_in_exception_message_is_redacted(self):
         """PTB 的 InvalidToken 会把 Token 原样写进异常消息里。"""
