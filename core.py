@@ -27,6 +27,9 @@ import requests
 
 log = logging.getLogger("clinepass.core")
 
+# 版本号（单一来源：bot 启动日志、/help、面板标题都取这里）
+__version__ = "0.0.1"
+
 # ==================== 常量 ====================
 DEFAULT_API_BASE = "https://api.cline.bot"
 # ClinePass 官方额度接口：返回 5 小时 / 本周 / 本月三个窗口的已用百分比
@@ -822,7 +825,7 @@ def render_panel(snapshots: Sequence[Snapshot], now: Optional[datetime] = None) 
     """渲染整块面板（不含分片）。"""
     moment = now or datetime.now(timezone.utc)
     stamp = moment.astimezone().strftime("%H:%M:%S")
-    sections = ["🤖 <b>ClinePass Status Panel</b>"]
+    sections = [f"🤖 <b>ClinePass Status Panel</b> · v{__version__}"]
     sections.extend(render_snapshot(s, moment) for s in snapshots)
     sections.append(f"🔄 <b>更新时间</b> {_esc(stamp)}")
     return f"\n\n{SECTION_SEP}\n\n".join(sections)

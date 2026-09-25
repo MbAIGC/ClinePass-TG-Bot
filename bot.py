@@ -26,6 +26,7 @@ from core import (
     ClinePassClient,
     KeyLimitError,
     Settings,
+    __version__,
     esc,
     mask_key,
     render_panel,
@@ -36,7 +37,7 @@ from core import (
 log = logging.getLogger("clinepass.bot")
 
 HELP_TEXT = (
-    "🤖 <b>ClinePass TG Bot 指令列表</b>\n\n"
+    f"🤖 <b>ClinePass TG Bot</b> · v{__version__}\n\n"
     "🔹 /status — 查看所有已绑定 Key 的额度面板\n"
     "🔹 /addkey &lt;别名&gt; &lt;API_KEY&gt; — 添加或更新指定别名的 Key\n"
     "🔹 /delkey &lt;别名&gt; — 删除指定的 Key\n"
@@ -123,7 +124,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "我可以帮你把 Cline / ClinePass 账号的额度做成面板。\n"
         "先私聊发送 <code>/addkey 主账号 sk_xxxx</code> 绑定一个 Key，"
         "再用 <code>/status</code> 查看额度。\n\n"
-        "输入 <code>/help</code> 查看全部指令。",
+        "输入 <code>/help</code> 查看全部指令。\n\n"
+        f"<code>ClinePass TG Bot v{__version__}</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -362,7 +364,8 @@ def main() -> int:
 
     suffix = f"…{token[-4:]}" if len(token) > 8 else ""
     log.info(
-        "启动中：API=%s 额度路径=%s 并行=%s 白名单=%s 演示模式=%s Token=***%s",
+        "ClinePass TG Bot v%s 启动中：API=%s 额度路径=%s 并行=%s 白名单=%s 演示模式=%s Token=***%s",
+        __version__,
         settings.api_base,
         settings.usage_path,
         settings.max_parallel,

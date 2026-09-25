@@ -471,6 +471,16 @@ class TestRender(unittest.TestCase):
         self.assertTrue(all(len(c) <= 800 for c in chunks))
 
 
+# ==================== 版本 ====================
+class TestVersion(unittest.TestCase):
+    def test_version_is_semver(self):
+        self.assertRegex(core.__version__, r"^\d+\.\d+\.\d+$")
+
+    def test_panel_shows_version(self):
+        text = render_panel([Snapshot("a", "k")], now=datetime(2026, 9, 25, tzinfo=timezone.utc))
+        self.assertIn(f"v{core.__version__}", text)
+
+
 # ==================== Settings ====================
 class TestSettings(unittest.TestCase):
     def test_defaults_and_bad_values(self):

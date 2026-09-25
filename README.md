@@ -1,5 +1,7 @@
 # 🤖 ClinePass TG Bot
 
+> 当前版本 **0.0.1**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
+
 把 Cline / ClinePass 账号的用量做成 Telegram 面板：一个用户可绑定多个 API Key，`/status` 一次看全部账号。
 
 ```
@@ -199,9 +201,10 @@ Authorization: Bearer sk_xxx
 
 ```
 .
+├── .github/workflows/ci.yml  # CI：单测矩阵 → 构建镜像+冒烟 → 打标签时推 GHCR
 ├── bot.py                # Telegram 交互层：指令、鉴权、限流、错误兜底
 ├── core.py               # 核心逻辑：JSON 存储、API 客户端、面板渲染（无 PTB 依赖，可单测）
-├── tests/test_core.py    # 43 个单元测试，纯标准库
+├── tests/test_core.py    # 45 个单元测试，纯标准库
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -217,7 +220,36 @@ Authorization: Bearer sk_xxx
 python3 -m unittest discover -s tests -t . -v
 ```
 
-覆盖范围：进度条边界、别名校验、消息分片（含超长单行硬切）、冷却器、配置读写/上限/权限/损坏恢复/目录异常、官方额度接口解析（`five_hour`/`weekly`/`monthly`、未知类型、非法值、空列表）、纳秒时间戳解析、重置倒计时、80%/95% 告警、客户端的成功、401、404、503 重试、网络异常、非 JSON 响应、DEMO 模式、HTML 转义与长面板分片。
+覆盖范围：进度条边界、别名校验、消息分片（含超长单行硬切）、冷却器、配置读写/上限/权限/损坏恢复/目录异常、官方额度接口解析（`five_hour`/`weekly`/`monthly`、未知类型、非法值、空列表）、纳秒时间戳解析、重置倒计时、80%/95% 告警、版本号、客户端的成功、401、404、503 重试、网络异常、非 JSON 响应、DEMO 模式、HTML 转义与长面板分片。
+
+## 持续集成与发布
+
+`.github/workflows/ci.yml` 在 push / PR / 手动触发时跑三个 job：
+
+| job | 内容 |
+| --- | --- |
+| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 45 个单元测试 |
+| `docker` | buildx 构建镜像（带 gha 缓存）→ 镜像内自检：能导入、非 root(10001)、命名卷可写配置、缺 Token 时退出码为 1 |
+| `publish` | 仅在 `main` 分支或 `v*` 标签上触发，推送到 GHCR（`ghcr.io/mbaigc/clinepass-tg-bot`） |
+
+发布一个新版本：
+
+```bash
+# 1) 改 core.py 里的 __version__（例如 0.0.2），提交并推送
+vim core.py && git commit -am "release: 0.0.2" && git push
+
+# 2) 打标签并推送，CI 会自动构建并推送镜像
+git tag v0.0.2 && git push origin v0.0.2
+```
+
+镜像标签规则：`v0.0.1` → `0.0.1`、`0.0`；`main` 分支 → `main` 与 `latest`。镜像公开后可以直接部署：
+
+```bash
+docker run -d --name clinepass_tg_bot --restart unless-stopped \
+  -e TELEGRAM_BOT_TOKEN=xxx \
+  -v clinepass-data:/app/data \
+  ghcr.io/mbaigc/clinepass-tg-bot:0.0.1
+```
 
 ## 故障排查
 
