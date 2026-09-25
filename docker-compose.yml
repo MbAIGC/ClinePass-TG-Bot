@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  clinepass-bot:
+    build: .
+    container_name: clinepass_tg_bot
+    restart: always
+    environment:
+      - TELEGRAM_BOT_TOKEN=你的_TELEGRAM_BOT_TOKEN
+      - CLINEPASS_API_URL=https://api.cline.bot/api/v1/user/usage
+      - TZ=Asia/Shanghai
+    volumes:
+      # 持久化挂载本地 JSON 配置文件
+      - ./config.json:/app/config.json
