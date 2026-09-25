@@ -1,0 +1,12 @@
+.git
+.gitignore
+data
+.env
+config.json
+config.json.corrupt-*
+__pycache__
+*.pyc
+tests
+.venv
+venv
+*.md

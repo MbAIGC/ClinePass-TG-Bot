@@ -1,14 +1,28 @@
-version: '3.8'
-
 services:
   clinepass-bot:
     build: .
+    image: clinepass-tg-bot:latest
     container_name: clinepass_tg_bot
-    restart: always
+    restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      - TELEGRAM_BOT_TOKEN=你的_TELEGRAM_BOT_TOKEN
-      - CLINEPASS_API_URL=https://api.cline.bot/api/v1/user/usage
-      - TZ=Asia/Shanghai
+      # 容器内配置路径（与下面的挂载点对应）
+      CONFIG_FILE: /app/data/config.json
+      TZ: Asia/Shanghai
     volumes:
-      # 持久化挂载本地 JSON 配置文件
-      - ./config.json:/app/config.json
+      # 默认用命名卷：Docker 会把镜像里 /app/data 的属主（非 root 的 app 用户）带过来，
+      # 开箱即可写，避免“宿主机目录属主是 root、容器里写不进去”的坑。
+      - clinepass-data:/app/data
+      # 想直接在宿主机看到 config.json，就注释掉上面一行，改用下面这行，并先执行：
+      #   mkdir -p ./data && sudo chown 10001:10001 ./data
+      # - ./data:/app/data
+    # 只读根文件系统 + 禁止提权，降低容器被攻破后的影响
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  clinepass-data:

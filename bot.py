@@ -1,281 +1,380 @@
+"""ClinePass TG Bot —— Telegram 交互层。
+
+用法：
+    export TELEGRAM_BOT_TOKEN=123456:ABC...
+    python bot.py
+
+核心逻辑（配置存储、API 客户端、渲染）见 core.py。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
 import os
-import json
-import datetime
-import requests
-from telegram import Update
+import sys
+
+from telegram import BotCommand, Update
+from telegram.constants import ChatType, ParseMode
+from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ==================== 基础配置 ====================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-CLINEPASS_API_URL = os.getenv("CLINEPASS_API_URL", "https://api.cline.bot/api/v1/user/usage")
+from core import (
+    ConfigError,
+    ConfigStore,
+    Cooldown,
+    ClinePassClient,
+    KeyLimitError,
+    Settings,
+    esc,
+    mask_key,
+    render_panel,
+    sanitize_alias,
+    split_message,
+)
 
-# 配置文件路径
-CONFIG_FILE = "config.json"
+log = logging.getLogger("clinepass.bot")
 
-# 默认备用数值（当 API 无法响应时显示）
-ENV_5H_USAGE = float(os.getenv("CLINEPASS_5H_USAGE", "63.0"))
-ENV_WEEK_USAGE = float(os.getenv("CLINEPASS_WEEK_USAGE", "48.0"))
-ENV_MONTH_USAGE = float(os.getenv("CLINEPASS_MONTH_USAGE", "31.0"))
-
-
-# ==================== JSON 配置文件管理 ====================
-def load_config() -> dict:
-    """读取 config.json，支持多 Key 字典结构"""
-    default_config = {
-        "user_keys": {}  # 格式: { "user_id": { "key_alias1": "key1", "key_alias2": "key2" } }
-    }
-
-    if not os.path.exists(CONFIG_FILE):
-        save_config(default_config)
-        return default_config
-
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if "user_keys" not in data:
-                data["user_keys"] = {}
-            return data
-    except Exception as e:
-        print(f"[ERROR] 读取 config.json 失败: {e}")
-        return default_config
+HELP_TEXT = (
+    "🤖 <b>ClinePass TG Bot 指令列表</b>\n\n"
+    "🔹 /status — 查看所有已绑定 Key 的额度面板\n"
+    "🔹 /addkey &lt;别名&gt; &lt;API_KEY&gt; — 添加或更新指定别名的 Key\n"
+    "🔹 /delkey &lt;别名&gt; — 删除指定的 Key\n"
+    "🔹 /keys — 列出已绑定的 Key 别名（只显示掩码）\n"
+    "🔹 /clear confirm — 清空你绑定的全部 Key\n"
+    "🔹 /id — 查看你的 Telegram 用户 ID\n"
+    "🔹 /help — 显示本帮助\n\n"
+    "🔒 涉及 Key 的指令仅在私聊生效；包含 Key 的消息会被自动撤回。"
+)
 
 
-def save_config(config_data: dict):
-    """保存配置数据到 config.json"""
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config_data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[ERROR] 写入 config.json 失败: {e}")
-
-
-def add_user_key(user_id: int, alias: str, api_key: str):
-    """为指定用户增加或修改一个 API Key"""
-    config = load_config()
-    uid = str(user_id)
-    if uid not in config["user_keys"]:
-        config["user_keys"][uid] = {}
-    
-    config["user_keys"][uid][alias] = api_key
-    save_config(config)
-
-
-def delete_user_key(user_id: int, alias: str) -> bool:
-    """删除指定的 API Key"""
-    config = load_config()
-    uid = str(user_id)
-    if uid in config["user_keys"] and alias in config["user_keys"][uid]:
-        del config["user_keys"][uid][alias]
-        save_config(config)
-        return True
-    return False
-
-
-def get_user_keys(user_id: int) -> dict:
-    """获取指定用户绑定的所有 Key 字典: {alias: key}"""
-    config = load_config()
-    return config["user_keys"].get(str(user_id), {})
-
-
-# ==================== 工具与 API 请求函数 ====================
-def make_progress_bar(percent: float, length: int = 10) -> str:
-    """生成进度条 [████████░░░░]"""
-    percent = max(0.0, min(100.0, percent))
-    filled_length = int(round(length * percent / 100))
-    return '█' * filled_length + '░' * (length - filled_length)
-
-
-def fetch_data_from_api(api_key: str) -> dict:
-    """携带指定的 API Key 请求接口"""
-    headers = {"User-Agent": "ClinePass-TG-Bot/1.0"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    response = requests.get(CLINEPASS_API_URL, headers=headers, timeout=10)
-    response.raise_for_status()
-    data = response.json()
-
-    return {
-        "h5_percent": float(data.get("h5", {}).get("percent", ENV_5H_USAGE)),
-        "h5_remaining": data.get("h5", {}).get("remaining_str", "1h 52m"),
-        "h5_reset": data.get("h5", {}).get("reset_time", "18:32"),
-        "week_percent": float(data.get("week", {}).get("percent", ENV_WEEK_USAGE)),
-        "week_reset": data.get("week", {}).get("reset_str", "周一 08:00"),
-        "month_percent": float(data.get("month", {}).get("percent", ENV_MONTH_USAGE)),
-        "month_reset": data.get("month", {}).get("reset_str", "10月1日")
-    }
-
-
-def render_single_status(alias: str, api_key: str) -> str:
-    """渲染单个 API Key 的面板文本"""
-    now = datetime.datetime.now()
-    usage = None
-
-    if CLINEPASS_API_URL and api_key:
-        try:
-            usage = fetch_data_from_api(api_key)
-        except Exception as e:
-            print(f"[Warning] Key [{alias}] 请求失败 ({e})")
-
-    if not usage:
-        if now.month == 12:
-            next_month = datetime.date(now.year + 1, 1, 1)
-        else:
-            next_month = datetime.date(now.year, now.month + 1, 1)
-
-        usage = {
-            "h5_percent": ENV_5H_USAGE,
-            "h5_remaining": "1h 52m",
-            "h5_reset": (now + datetime.timedelta(hours=1, minutes=52)).strftime("%H:%M"),
-            "week_percent": ENV_WEEK_USAGE,
-            "week_reset": "周一 08:00",
-            "month_percent": ENV_MONTH_USAGE,
-            "month_reset": f"{next_month.month}月1日"
-        }
-
-    h5_bar = make_progress_bar(usage["h5_percent"])
-    week_bar = make_progress_bar(usage["week_percent"])
-    month_bar = make_progress_bar(usage["month_percent"])
-
-    return (
-        f"🔑 **账号/别名：{alias}**\n"
-        f"📊 **5小时额度**\n"
-        f"`{h5_bar}` {int(usage['h5_percent'])}%\n"
-        f"剩余：{usage['h5_remaining']}  重置：{usage['h5_reset']}\n\n"
-        f"📅 **本周额度**\n"
-        f"`{week_bar}` {int(usage['week_percent'])}%\n"
-        f"重置：{usage['week_reset']}\n\n"
-        f"📆 **本月额度**\n"
-        f"`{month_bar}` {int(usage['month_percent'])}%\n"
-        f"重置：{usage['month_reset']}"
+def setup_logging() -> None:
+    level = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
 
 
-# ==================== Telegram 命令处理函数 ====================
-async def addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理 /addkey <别名> <API_KEY> 指令"""
-    user_id = update.effective_user.id
-    
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "⚠️ 请输入完整参数！\n"
-            "格式：`/addkey <别名/账号标识> <API_KEY>`\n"
-            "示例：`/addkey 主账号 sk-12345678`",
-            parse_mode="Markdown"
+class BotContext:
+    """把设置、存储、客户端、节流器打包，避免到处用全局变量。"""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.store = ConfigStore(settings.config_file, settings.max_keys_per_user)
+        self.client = ClinePassClient(settings)
+        self.cooldown = Cooldown(settings.status_cooldown)
+        self.locks: dict[int, asyncio.Lock] = {}
+
+    def lock_for(self, user_id: int) -> asyncio.Lock:
+        return self.locks.setdefault(user_id, asyncio.Lock())
+
+
+def ctx_of(context: ContextTypes.DEFAULT_TYPE) -> BotContext:
+    return context.application.bot_data["ctx"]
+
+
+# ==================== 通用守卫 ====================
+async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE, private: bool = True) -> bool:
+    """统一鉴权：白名单 + 私聊限制。返回 True 表示可以继续处理。"""
+    ctx = ctx_of(context)
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return False
+
+    if not ctx.settings.is_allowed(user.id):
+        await message.reply_text(
+            f"⛔️ 你不在白名单中，无法使用本 Bot。\n你的用户 ID：<code>{user.id}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return False
+
+    chat = update.effective_chat
+    if private and (chat is None or chat.type != ChatType.PRIVATE):
+        await message.reply_text("🔒 该指令涉及你的 API Key，请在私聊中使用。")
+        return False
+    return True
+
+
+async def _load_keys(ctx: BotContext, user_id: int, message) -> dict[str, str] | None:
+    """读取用户 Key；存储不可用时明确报错（而不是假装成功）。"""
+    try:
+        return ctx.store.keys(user_id)
+    except ConfigError as exc:
+        log.error("读取配置失败：%s", exc)
+        await message.reply_text(
+            "❌ 配置存储不可用，操作已取消。\n"
+            f"原因：<code>{str(exc)[:300]}</code>\n"
+            "请检查 CONFIG_FILE 路径与挂载权限。",
+            parse_mode=ParseMode.HTML,
+        )
+        return None
+
+
+# ==================== 指令处理 ====================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context, private=False):
+        return
+    user = update.effective_user
+    assert user is not None
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        f"👋 你好，<b>{user.first_name or '朋友'}</b>！\n\n"
+        "我可以帮你把 Cline / ClinePass 账号的额度做成面板。\n"
+        "先私聊发送 <code>/addkey 主账号 sk_xxxx</code> 绑定一个 Key，"
+        "再用 <code>/status</code> 查看额度。\n\n"
+        "输入 <code>/help</code> 查看全部指令。",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context, private=False):
+        return
+    await update.effective_message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
+
+
+async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context, private=False):
+        return
+    user, chat = update.effective_user, update.effective_chat
+    lines = [f"🆔 用户 ID：<code>{user.id}</code>" if user else "🆔 用户 ID：未知"]
+    if chat:
+        lines.append(f"💬 会话 ID：<code>{chat.id}</code>（{chat.type}）")
+    await update.effective_message.reply_text(  # type: ignore[union-attr]
+        "\n".join(lines) + "\n\n把用户 ID 填进 <code>ALLOWED_USER_IDS</code> 即可启用白名单。",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def keys_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context):
+        return
+    ctx = ctx_of(context)
+    user_keys = await _load_keys(ctx, update.effective_user.id, update.effective_message)  # type: ignore[union-attr]
+    if user_keys is None:
+        return
+    if not user_keys:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "⚠️ 你还没有绑定任何 Key。\n用法：<code>/addkey 主账号 sk_xxxx</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    lines = ["📋 <b>已绑定的 Key</b>", ""]
+    lines.extend(f"• <b>{esc(alias)}</b>：<code>{esc(mask_key(key))}</code>" for alias, key in user_keys.items())
+    lines.append("")
+    lines.append(f"共 {len(user_keys)} 个")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
+
+
+async def addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context):
+        return
+    ctx = ctx_of(context)
+    message = update.effective_message
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+    chat_id = update.effective_chat.id
+
+    async def say(text: str) -> None:
+        await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+
+    # 先撤回这条含明文 Key 的消息：无论参数是否合法，都不把 Key 留在聊天记录里。
+    # 原消息删除后仍可正常 send_message，所以后续统一用它回复。
+    deleted = False
+    try:
+        await message.delete()  # type: ignore[union-attr]
+        deleted = True
+    except TelegramError as exc:
+        log.warning("撤回含 Key 的消息失败：%s", exc)
+
+    args = context.args or []
+    if len(args) < 2:
+        await say(
+            "⚠️ 参数不完整。\n"
+            "格式：<code>/addkey &lt;别名&gt; &lt;API_KEY&gt;</code>\n"
+            "示例：<code>/addkey 主账号 sk_1234567890</code>"
         )
         return
 
-    alias = context.args[0].strip()
-    api_key = context.args[1].strip()
+    alias = sanitize_alias(args[0])
+    api_key = args[1].strip()
+    if alias is None:
+        await say("⚠️ 别名不合法：需为 1–24 个字符，仅限中英文、数字、下划线、点、连字符和空格。")
+        return
+    if len(api_key) < 8 or any(ch.isspace() for ch in api_key):
+        await say("⚠️ API Key 看起来不合法（长度需 ≥ 8 且不含空白字符）。")
+        return
 
-    add_user_key(user_id, alias, api_key)
-
-    # 尝试撤回包含敏感 Key 的消息
     try:
-        await update.message.delete()
-    except Exception:
-        pass
+        async with ctx.lock_for(user_id):
+            await asyncio.to_thread(ctx.store.add, user_id, alias, api_key)
+    except KeyLimitError as exc:
+        await say(f"⚠️ {esc(str(exc))}")
+        return
+    except ConfigError as exc:
+        log.error("写入配置失败：%s", exc)
+        await say("❌ 保存失败，Key <b>没有</b>被记录。\n" f"原因：<code>{esc(str(exc)[:300])}</code>")
+        return
 
-    masked_key = api_key[:4] + "...." + api_key[-4:] if len(api_key) > 8 else "****"
-    await update.message.reply_text(
-        f"✅ 已成功保存/更新 Key！\n"
-        f"📌 别名：`{alias}`\n"
-        f"🔐 Key：`{masked_key}`\n"
-        f"*(包含 Key 的消息已自动撤回)*",
-        parse_mode="Markdown"
+    note = "（含 Key 的消息已撤回）" if deleted else "（⚠️ 未能撤回原消息，建议自行删除）"
+    await say(
+        f"✅ 已保存 Key\n📌 别名：<code>{esc(alias)}</code>\n"
+        f"🔐 Key：<code>{esc(mask_key(api_key))}</code>\n{note}"
     )
 
 
-async def delkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理 /delkey <别名> 指令"""
-    user_id = update.effective_user.id
-    
+async def delkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context):
+        return
+    ctx = ctx_of(context)
     if not context.args:
-        await update.message.reply_text("⚠️ 请指定要删除的 Key 别名！\n格式：`/delkey <别名>`", parse_mode="Markdown")
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "⚠️ 请指定别名。\n格式：<code>/delkey &lt;别名&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
-
     alias = context.args[0].strip()
-    if delete_user_key(user_id, alias):
-        await update.message.reply_text(f"🗑️ 已成功删除别名为 `{alias}` 的 Key。", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"❌ 未找到别名为 `{alias}` 的 Key。", parse_mode="Markdown")
+    try:
+        async with ctx.lock_for(update.effective_user.id):  # type: ignore[union-attr]
+            removed = await asyncio.to_thread(ctx.store.delete, update.effective_user.id, alias)  # type: ignore[union-attr]
+    except ConfigError as exc:
+        await update.effective_message.reply_text(f"❌ 删除失败：<code>{esc(str(exc)[:200])}</code>", parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
+        return
+    text = f"🗑️ 已删除别名 <b>{esc(alias)}</b>。" if removed else f"❌ 未找到别名 <b>{esc(alias)}</b>。"
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
 
 
-async def keys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """查看当前绑定的所有 Key 列表"""
-    user_id = update.effective_user.id
-    user_keys = get_user_keys(user_id)
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context):
+        return
+    ctx = ctx_of(context)
+    if [a.lower() for a in (context.args or [])] != ["confirm"]:
+        await update.effective_message.reply_text(  # type: ignore[union-attr]
+            "⚠️ 这会删除你绑定的<b>全部</b> Key，确认请输入：<code>/clear confirm</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        async with ctx.lock_for(update.effective_user.id):  # type: ignore[union-attr]
+            removed = await asyncio.to_thread(ctx.store.clear, update.effective_user.id)  # type: ignore[union-attr]
+    except ConfigError as exc:
+        await update.effective_message.reply_text(f"❌ 操作失败：<code>{esc(str(exc)[:200])}</code>", parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
+        return
+    await update.effective_message.reply_text(f"🧹 已清空 {removed} 个 Key。", parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
 
-    if not user_keys:
-        await update.message.reply_text("⚠️ 你尚未绑定任何 Key。请使用 `/addkey <别名> <API_KEY>` 添加。", parse_mode="Markdown")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context):
+        return
+    ctx = ctx_of(context)
+    message = update.effective_message
+    user_id = update.effective_user.id  # type: ignore[union-attr]
+
+    wait = ctx.cooldown.hit(user_id)
+    if wait > 0:
+        await message.reply_text(f"⏳ 操作太快了，请 {wait:.0f} 秒后再试。")  # type: ignore[union-attr]
         return
 
-    text = "📋 **你已绑定的 Key 列表：**\n\n"
-    for alias, key in user_keys.items():
-        masked_key = key[:4] + "...." + key[-4:] if len(key) > 8 else "****"
-        text += f"• **{alias}**: `{masked_key}`\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """汇总并展示所有 Key 的额度面板"""
-    user_id = update.effective_user.id
-    user_keys = get_user_keys(user_id)
-
+    user_keys = await _load_keys(ctx, user_id, message)
+    if user_keys is None:
+        return
     if not user_keys:
-        await update.message.reply_text(
-            "⚠️ 当前未绑定任何 API Key！\n"
-            "请先使用 `/addkey <别名> <API_KEY>` 绑定你的密钥。",
-            parse_mode="Markdown"
+        await message.reply_text(  # type: ignore[union-attr]
+            "⚠️ 你还没有绑定任何 Key。\n用法：<code>/addkey 主账号 sk_xxxx</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
-    now_str = datetime.datetime.now().strftime("%H:%M:%S")
-    sections = [f"🤖 **ClinePass Status Panel**"]
+    notice = await message.reply_text(f"⏳ 正在查询 {len(user_keys)} 个账号…")  # type: ignore[union-attr]
+    try:
+        snapshots = await ctx.client.fetch_all(list(user_keys.items()))
+        chunks = split_message(render_panel(snapshots), ctx.settings.message_limit)
+    finally:
+        # 无论成功失败都收起"正在查询"，避免残留一条假进度
+        try:
+            await notice.delete()
+        except TelegramError:
+            pass
 
-    # 循环遍历用户绑定的每一个 Key 并生成对应的渲染面板
-    for alias, api_key in user_keys.items():
-        sections.append(render_single_status(alias, api_key))
-
-    sections.append(f"🔄 **更新时间** {now_str}")
-    
-    # 组合多段内容输出，用分割线分隔各个 Key 的状态
-    full_message = "\n\n───────────────\n\n".join(sections)
-    await update.message.reply_text(full_message, parse_mode="Markdown")
+    for chunk in chunks:
+        await context.bot.send_message(
+            update.effective_chat.id,
+            chunk,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "🤖 **ClinePass TG Bot 指令列表**\n\n"
-        "🔹 `/status` - 查看所有已绑定 Key 的额度面板\n"
-        "🔹 `/addkey <别名> <API_KEY>` - 添加或更新指定别名的 Key\n"
-        "🔹 `/delkey <别名>` - 删除指定的 Key\n"
-        "🔹 `/keys` - 列出你已绑定的所有 Key 别名\n"
-        "🔹 `/help` - 显示帮助菜单"
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("处理更新时发生未捕获异常", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text("😵 处理时出错了，请稍后再试或联系管理员查看日志。")
+        except TelegramError:
+            pass
+
+
+async def post_init(application: Application) -> None:
+    await application.bot.set_my_commands(
+        [
+            BotCommand("status", "查看额度面板"),
+            BotCommand("addkey", "添加或更新 Key"),
+            BotCommand("delkey", "删除 Key"),
+            BotCommand("keys", "列出已绑定的别名"),
+            BotCommand("clear", "清空全部 Key"),
+            BotCommand("id", "查看我的用户 ID"),
+            BotCommand("help", "帮助"),
+        ]
     )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
-def main():
-    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN" or not TELEGRAM_BOT_TOKEN:
-        print("[ERROR] 请在环境变量中提供有效的 TELEGRAM_BOT_TOKEN！")
-        return
+def build_application(settings: Settings, token: str) -> Application:
+    ctx = BotContext(settings)
+    application = Application.builder().token(token).post_init(post_init).build()
+    application.bot_data["ctx"] = ctx
 
-    load_config()
-
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", status_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("addkey", addkey_command))
-    app.add_handler(CommandHandler("delkey", delkey_command))
-    app.add_handler(CommandHandler("keys", keys_command))
-    app.add_handler(CommandHandler("help", help_command))
-
-    print("ClinePass TG Bot (多 Key 版本) 启动成功...")
-    app.run_polling()
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("id", id_command))
+    application.add_handler(CommandHandler(["status", "quota"], status_command))
+    application.add_handler(CommandHandler("addkey", addkey_command))
+    application.add_handler(CommandHandler("delkey", delkey_command))
+    application.add_handler(CommandHandler("keys", keys_command))
+    application.add_handler(CommandHandler("clear", clear_command))
+    application.add_error_handler(on_error)
+    return application
 
 
-if __name__ == '__main__':
-    main()
+def main() -> int:
+    setup_logging()
+    settings = Settings.from_env()
+
+    try:
+        ConfigStore(settings.config_file, settings.max_keys_per_user).load()
+        log.info("配置存储就绪：%s", settings.config_file)
+    except ConfigError as exc:
+        log.critical("配置存储不可用：%s", exc)
+
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    if not token or token == "YOUR_TELEGRAM_BOT_TOKEN":
+        log.critical("未配置 TELEGRAM_BOT_TOKEN，请参考 .env.example 设置后重启。")
+        return 1
+
+    suffix = f"…{token[-4:]}" if len(token) > 8 else ""
+    log.info(
+        "启动中：API=%s 额度路径=%s 并行=%s 白名单=%s 演示模式=%s Token=***%s",
+        settings.api_base,
+        settings.usage_path,
+        settings.max_parallel,
+        len(settings.allowed_user_ids) or "关闭",
+        settings.demo_mode,
+        suffix,
+    )
+
+    application = build_application(settings, token)
+    application.run_polling(drop_pending_updates=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

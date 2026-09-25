@@ -1,0 +1,396 @@
+"""core.py 的单元测试：python3 -m unittest discover -s tests -v
+
+只依赖标准库（core 需要 requests，运行环境已自带）。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import core  # noqa: E402
+from core import (  # noqa: E402
+    ApiError,
+    ClinePassClient,
+    ConfigError,
+    ConfigStore,
+    Cooldown,
+    KeyLimitError,
+    Settings,
+    mask_key,
+    parse_usage,
+    progress_bar,
+    render_panel,
+    render_snapshot,
+    sanitize_alias,
+    split_message,
+    Snapshot,
+    Window,
+)
+
+
+# ==================== 假 HTTP ====================
+class FakeResponse:
+    def __init__(self, status_code: int, payload=None, text: str = ""):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("not json")
+        return self._payload
+
+
+class FakeSession:
+    def __init__(self, routes):
+        """routes: {path: FakeResponse | list[FakeResponse] | Exception}"""
+        self.routes = routes
+        self.headers = {}
+        self.calls: list[str] = []
+
+    def get(self, url, headers=None, timeout=None):
+        path = url.split("cline.bot", 1)[-1]
+        self.calls.append(path)
+        if path not in self.routes:
+            return FakeResponse(404, {"error": "Not Found", "success": False})
+        route = self.routes[path]
+        if isinstance(route, list):
+            route = route.pop(0) if len(route) > 1 else route[0]
+        if isinstance(route, Exception):
+            raise route
+        return route
+
+
+def settings_for(tmp: str, **kwargs) -> Settings:
+    base = dict(
+        config_file=os.path.join(tmp, "config.json"),
+        api_base="https://api.cline.bot",
+        http_retries=0,
+        retry_backoff=0.0,
+        status_cooldown=0.0,
+        max_keys_per_user=3,
+    )
+    base.update(kwargs)
+    return Settings(**base)
+
+
+# ==================== 渲染工具 ====================
+class TestHelpers(unittest.TestCase):
+    def test_progress_bar_edges(self):
+        self.assertEqual(progress_bar(0), "░" * 10)
+        self.assertEqual(progress_bar(100), "█" * 10)
+        self.assertEqual(progress_bar(-5), "░" * 10)
+        self.assertEqual(progress_bar(1000), "█" * 10)
+        self.assertEqual(len(progress_bar(63)), 10)
+        self.assertEqual(progress_bar(50, 4), "██░░")
+
+    def test_mask_key(self):
+        self.assertEqual(mask_key("sk_1234567890"), "sk_1…7890")
+        self.assertEqual(mask_key("short"), "****")
+        self.assertEqual(mask_key(""), "****")
+
+    def test_sanitize_alias(self):
+        self.assertEqual(sanitize_alias(" 主账号 "), "主账号")
+        self.assertEqual(sanitize_alias("work-1.v2"), "work-1.v2")
+        self.assertIsNone(sanitize_alias(""))
+        self.assertIsNone(sanitize_alias("a" * 25))
+        self.assertIsNone(sanitize_alias("bad;rm -rf"))
+
+    def test_split_message(self):
+        self.assertEqual(split_message("hi", 100), ["hi"])
+        text = "\n".join(f"line-{i}" for i in range(200))
+        chunks = split_message(text, 100)
+        self.assertTrue(all(len(c) <= 100 for c in chunks))
+        self.assertEqual("".join(chunks).replace("\n", ""), text.replace("\n", ""))
+
+    def test_split_message_hard_cut(self):
+        chunks = split_message("x" * 250, 100)
+        self.assertEqual([len(c) for c in chunks], [100, 100, 50])
+
+    def test_cooldown(self):
+        cd = Cooldown(5)
+        self.assertEqual(cd.hit(1, now=100.0), 0.0)
+        self.assertEqual(cd.hit(1, now=102.0), 3.0)
+        self.assertEqual(cd.hit(1, now=106.0), 0.0)
+        self.assertEqual(cd.hit(2, now=106.0), 0.0)  # 不同用户互不影响
+        self.assertEqual(Cooldown(0).hit(1), 0.0)
+
+
+# ==================== 配置存储 ====================
+class TestConfigStore(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "config.json")
+        self.store = ConfigStore(self.path, max_keys_per_user=3)
+
+    def test_creates_file_on_first_load(self):
+        data = self.store.load()
+        self.assertEqual(data["user_keys"], {})
+        self.assertTrue(os.path.isfile(self.path))
+
+    def test_add_delete_persist(self):
+        self.store.add(1, "主账号", "sk_aaaaaaaaaaaa")
+        self.store.add(1, "备用", "sk_bbbbbbbbbbbb")
+        self.assertEqual(self.store.keys(1), {"主账号": "sk_aaaaaaaaaaaa", "备用": "sk_bbbbbbbbbbbb"})
+        self.assertTrue(self.store.delete(1, "备用"))
+        self.assertFalse(self.store.delete(1, "不存在"))
+        # 重新读盘确认真的落盘
+        self.assertEqual(ConfigStore(self.path).keys(1), {"主账号": "sk_aaaaaaaaaaaa"})
+        self.assertEqual(self.store.clear(1), 1)
+        self.assertEqual(self.store.keys(1), {})
+
+    def test_key_limit(self):
+        for i in range(3):
+            self.store.add(1, f"k{i}", "sk_123456789")
+        with self.assertRaises(KeyLimitError):
+            self.store.add(1, "overflow", "sk_123456789")
+        # 覆盖已有别名不受限制
+        self.store.add(1, "k0", "sk_updatedvalue")
+
+    def test_file_permissions(self):
+        self.store.add(1, "a", "sk_123456789")
+        mode = os.stat(self.path).st_mode & 0o777
+        self.assertEqual(mode, 0o600, f"配置文件权限应为 600，实际 {oct(mode)}")
+
+    def test_corrupt_file_is_backed_up_not_wiped(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{ this is not json")
+        data = self.store.load()
+        self.assertEqual(data["user_keys"], {})
+        backups = [f for f in os.listdir(self.tmp.name) if ".corrupt-" in f]
+        self.assertEqual(len(backups), 1)
+
+    def test_directory_path_raises_config_error(self):
+        os.makedirs(os.path.join(self.tmp.name, "as-dir.json"))
+        store = ConfigStore(os.path.join(self.tmp.name, "as-dir.json"))
+        with self.assertRaises(ConfigError) as cm:
+            store.load()
+        self.assertIn("目录", str(cm.exception))
+
+    def test_non_object_json_rejected(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump([1, 2, 3], fh)
+        with self.assertRaises(ConfigError):
+            self.store.load()
+
+    def test_atomic_write_leaves_no_temp_files(self):
+        self.store.add(1, "a", "sk_123456789")
+        leftovers = [f for f in os.listdir(self.tmp.name) if f.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+
+
+# ==================== 额度解析 ====================
+class TestParseUsage(unittest.TestCase):
+    def test_envelope_shape(self):
+        windows = parse_usage(
+            {
+                "success": True,
+                "data": {
+                    "h5": {"percent": 63, "remaining_str": "1h 52m", "reset_time": "18:32"},
+                    "week": {"percent": 48.4, "reset_str": "周一 08:00"},
+                    "month": {"percent": 31},
+                },
+            }
+        )
+        self.assertIsNotNone(windows)
+        assert windows is not None
+        self.assertEqual([w.label for w in windows], ["5 小时额度", "本周额度", "本月额度"])
+        self.assertEqual(windows[0].remaining, "1h 52m")
+        self.assertEqual(windows[1].percent, 48.4)
+
+    def test_toplevel_and_aliases(self):
+        windows = parse_usage({"5h": 10, "weekly": {"used_percent": 20}, "monthly": {"percent": 0}})
+        self.assertIsNotNone(windows)
+        assert windows is not None
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(windows[2].percent, 0.0)
+
+    def test_nested_usage_key(self):
+        windows = parse_usage({"data": {"usage": {"h5": {"percent": 5}}}})
+        assert windows is not None
+        self.assertEqual(windows[0].percent, 5.0)
+
+    def test_unparseable_returns_none(self):
+        self.assertIsNone(parse_usage({"data": {"email": "a@b.c"}}))
+        self.assertIsNone(parse_usage({"h5": {"foo": "bar"}}))
+        self.assertIsNone(parse_usage("nope"))
+        self.assertIsNone(parse_usage({}))
+
+    def test_percent_clamped_and_nan_rejected(self):
+        windows = parse_usage({"h5": {"percent": 250}, "week": {"percent": "abc"}, "month": {"percent": -3}})
+        assert windows is not None
+        self.assertEqual(windows[0].percent, 100.0)
+        self.assertEqual([w.label for w in windows], ["5 小时额度", "本月额度"])
+
+
+# ==================== API 客户端 ====================
+class TestClient(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.settings = settings_for(self.tmp.name)
+
+    def client(self, routes):
+        return ClinePassClient(self.settings, session=FakeSession(routes))
+
+    def test_happy_path_with_real_envelope(self):
+        session = FakeSession(
+            {
+                "/api/v1/users/me": FakeResponse(200, {"success": True, "data": {"email": "a@b.c", "displayName": "Tester"}}),
+                "/api/v1/users/me/plan": FakeResponse(
+                    200,
+                    {
+                        "success": True,
+                        "data": {
+                            "plan": {"displayName": "Cline Pass (Monthly)", "interval": "Monthly", "isActive": True},
+                            "currentPeriodStart": "2026-09-23T12:03:54Z",
+                            "currentPeriodEnd": "2026-10-23T12:03:54Z",
+                        },
+                    },
+                ),
+                "/api/v1/user/usage": FakeResponse(
+                    200, {"success": True, "data": {"h5": {"percent": 63, "remaining_str": "1h 52m"}}}
+                ),
+            }
+        )
+        snapshot = ClinePassClient(self.settings, session=session).fetch_snapshot_sync("主账号", "sk_test123456")
+        self.assertEqual(snapshot.account["email"], "a@b.c")
+        self.assertEqual(snapshot.plan["displayName"], "Cline Pass (Monthly)")
+        self.assertEqual(snapshot.windows[0].percent, 63.0)
+        self.assertEqual(snapshot.warnings, [])
+
+    def test_invalid_key_short_circuits(self):
+        session = FakeSession({"/api/v1/users/me": FakeResponse(401, {"error": "Unauthorized"})})
+        snapshot = ClinePassClient(self.settings, session=session).fetch_snapshot_sync("x", "sk_bad")
+        self.assertFalse(snapshot.has_usage)
+        self.assertTrue(any("401" in w for w in snapshot.warnings))
+        # 401 后不再请求其它接口
+        self.assertEqual(session.calls, ["/api/v1/users/me"])
+
+    def test_missing_usage_endpoint_is_reported_not_faked(self):
+        session = FakeSession(
+            {
+                "/api/v1/users/me": FakeResponse(200, {"data": {"email": "a@b.c"}}),
+                "/api/v1/users/me/plan": FakeResponse(200, {"data": {"plan": {"name": "Cline Pass"}}}),
+            }
+        )
+        snapshot = ClinePassClient(self.settings, session=session).fetch_snapshot_sync("x", "sk_test123456")
+        self.assertFalse(snapshot.has_usage)
+        self.assertTrue(any("404" in w for w in snapshot.warnings))
+        text = render_snapshot(snapshot)
+        self.assertIn("暂无可显示的额度数据", text)
+        self.assertNotIn("63%", text)
+
+    def test_retry_on_server_error_then_success(self):
+        session = FakeSession(
+            {
+                "/api/v1/users/me": FakeResponse(200, {"data": {"email": "a@b.c"}}),
+                "/api/v1/users/me/plan": FakeResponse(200, {"data": {}}),
+                "/api/v1/user/usage": [FakeResponse(503, {"error": "boom"}), FakeResponse(200, {"data": {"h5": {"percent": 7}}})],
+            }
+        )
+        settings = settings_for(self.tmp.name, http_retries=1)
+        original_sleep = core.time.sleep
+        core.time.sleep = lambda *_: None
+        try:
+            snapshot = ClinePassClient(settings, session=session).fetch_snapshot_sync("x", "sk_test123456")
+        finally:
+            core.time.sleep = original_sleep
+        self.assertEqual(snapshot.windows[0].percent, 7.0)
+
+    def test_network_error_classified(self):
+        import requests
+
+        session = FakeSession({"/api/v1/users/me": requests.ConnectionError("no route")})
+        snapshot = ClinePassClient(self.settings, session=session).fetch_snapshot_sync("x", "sk_test123456")
+        self.assertTrue(any("网络" in w for w in snapshot.warnings))
+
+    def test_non_json_body(self):
+        session = FakeSession({"/api/v1/users/me": FakeResponse(200, None, text="<html>oops</html>")})
+        snapshot = ClinePassClient(self.settings, session=session).fetch_snapshot_sync("x", "sk_test123456")
+        self.assertTrue(any("账号信息获取失败" in w for w in snapshot.warnings))
+
+    def test_demo_mode_marks_sample_data(self):
+        settings = settings_for(self.tmp.name, demo_mode=True)
+        session = FakeSession({"/api/v1/users/me": FakeResponse(200, {"data": {"email": "a@b.c"}}), "/api/v1/users/me/plan": FakeResponse(200, {"data": {}})})
+        snapshot = ClinePassClient(settings, session=session).fetch_snapshot_sync("x", "sk_test123456")
+        self.assertTrue(any("DEMO_MODE" in w for w in snapshot.warnings))
+        self.assertEqual(len(snapshot.windows), 3)
+
+
+# ==================== 渲染与安全 ====================
+class TestRender(unittest.TestCase):
+    def test_html_escaping(self):
+        snapshot = Snapshot(
+            alias="<script>alert(1)</script>",
+            key_mask=mask_key("sk_1234567890"),
+            account={"email": "<b>x</b>@y.z"},
+            windows=[Window("5 小时额度", 63.0, "1h 52m", "18:32")],
+        )
+        text = render_panel([snapshot], now="12:00:00")
+        self.assertNotIn("<script>", text)
+        self.assertIn("&lt;script&gt;", text)
+        self.assertIn("&lt;b&gt;x&lt;/b&gt;@y.z", text)
+        self.assertIn("12:00:00", text)
+
+    def test_alias_with_markdown_chars_is_rendered_literally(self):
+        snapshot = Snapshot(alias="a_b*c", key_mask="sk_1…7890", windows=[Window("本周额度", 50.0)])
+        text = render_snapshot(snapshot)
+        self.assertIn("a_b*c", text)
+        self.assertNotIn("**", text)
+
+    def test_missing_fields_do_not_crash(self):
+        text = render_panel([Snapshot(alias="x", key_mask="****")], now="00:00:00")
+        self.assertIn("账号/别名：x", text)
+
+    def test_split_panel_keeps_all_aliases(self):
+        snapshots = [Snapshot(alias=f"acc{i}", key_mask="sk_1…7890", windows=[Window("本周额度", 50.0)]) for i in range(60)]
+        chunks = split_message(render_panel(snapshots, now="00:00:00"), 800)
+        joined = "\n".join(chunks)
+        for i in range(60):
+            self.assertIn(f"acc{i}", joined)
+        self.assertTrue(all(len(c) <= 800 for c in chunks))
+
+
+# ==================== Settings ====================
+class TestSettings(unittest.TestCase):
+    def test_defaults_and_bad_values(self):
+        s = Settings.from_env({})
+        self.assertEqual(s.api_base, "https://api.cline.bot")
+        self.assertEqual(s.max_keys_per_user, 10)
+        self.assertFalse(s.demo_mode)
+        self.assertTrue(s.is_allowed(123))  # 无白名单 = 全放开
+
+        s = Settings.from_env(
+            {
+                "MAX_KEYS_PER_USER": "not-a-number",
+                "REQUEST_TIMEOUT": "abc",
+                "DEMO_MODE": "true",
+                "ALLOWED_USER_IDS": "1, 2; x 3",
+                "CLINEPASS_API_BASE": "https://example.com/",
+            }
+        )
+        self.assertEqual(s.max_keys_per_user, 10)
+        self.assertEqual(s.request_timeout, 12.0)
+        self.assertTrue(s.demo_mode)
+        self.assertEqual(s.allowed_user_ids, frozenset({1, 2, 3}))
+        self.assertEqual(s.api_base, "https://example.com")
+        self.assertTrue(s.is_allowed(2))
+        self.assertFalse(s.is_allowed(99))
+
+    def test_clamping(self):
+        s = Settings.from_env({"HTTP_RETRIES": "99", "MAX_PARALLEL": "0", "MESSAGE_LIMIT": "99999"})
+        self.assertEqual(s.http_retries, 5)
+        self.assertEqual(s.max_parallel, 1)
+        self.assertEqual(s.message_limit, 4096)
+
+
+if __name__ == "__main__":
+    unittest.main()

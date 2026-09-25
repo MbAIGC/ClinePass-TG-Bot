@@ -1,0 +1,12 @@
+# 运行期数据：包含明文 API Key，绝对不能提交
+config.json
+config.json.corrupt-*
+data/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
