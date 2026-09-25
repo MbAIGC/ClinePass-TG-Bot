@@ -548,6 +548,73 @@ class TestSelfCheck(unittest.TestCase):
         self.assertEqual(self.store.add(1, "a", "sk_987654321"), 2)
 
 
+# ==================== 命令文本修复 ====================
+class TestCommandNormalize(unittest.TestCase):
+    def test_plain_command(self):
+        self.assertEqual(core.parse_command_tokens("/addkey Cline01 sk_x"), ("addkey", ["Cline01", "sk_x"]))
+
+    def test_ideographic_space_from_chinese_ime(self):
+        """中文输入法的全角空格：Telegram 不认，实体会把别名也吞进命令名。"""
+        self.assertEqual(
+            core.parse_command_tokens("/addkey\u3000Cline01 sk_x"), ("addkey", ["Cline01", "sk_x"])
+        )
+
+    def test_zero_width_inside_command_name_is_deleted(self):
+        self.assertEqual(
+            core.parse_command_tokens("/add\u200bkey Cline-03 sk_x"),
+            ("addkey", ["Cline-03", "sk_x"]),
+        )
+
+    def test_zero_width_used_as_separator_is_a_space(self):
+        """零宽字符也可能被当成命令与参数之间的分隔符。"""
+        self.assertEqual(
+            core.parse_command_tokens("/addkey\u200bCline01 sk_x", "space"),
+            ("addkey", ["Cline01", "sk_x"]),
+        )
+
+    def test_candidates_cover_both_meanings(self):
+        self.assertIn(("addkey", ["Cline01", "sk_x"]), core.parse_command_candidates("/addkey\u200bCline01 sk_x"))
+        self.assertIn(("addkey", ["Cline-03", "sk_x"]), core.parse_command_candidates("/add\u200bkey Cline-03 sk_x"))
+        self.assertEqual(len(core.parse_command_candidates("/keys")), 1)
+
+    def test_full_width_slash(self):
+        self.assertEqual(core.parse_command_tokens("／status"), ("status", []))
+        self.assertEqual(core.parse_command_tokens("／addkey Cline01 sk_x"), ("addkey", ["Cline01", "sk_x"]))
+
+    def test_code_block_wrapper(self):
+        self.assertEqual(
+            core.parse_command_tokens("`/addkey Cline01 sk_x`"), ("addkey", ["Cline01", "sk_x"])
+        )
+        self.assertEqual(core.parse_command_tokens("``/status``"), ("status", []))
+
+    def test_bot_mention_is_stripped(self):
+        self.assertEqual(core.parse_command_tokens("/addkey@MyBot a sk_x"), ("addkey", ["a", "sk_x"]))
+
+    def test_command_name_is_lowercased(self):
+        self.assertEqual(core.parse_command_tokens("/ADDKEY a sk_x")[0], "addkey")
+
+    def test_junk_input(self):
+        for text in ("", "   ", "在吗", "``"):
+            name, args = core.parse_command_tokens(text)
+            self.assertEqual(args, [], text)
+        self.assertEqual(core.parse_command_tokens("在吗")[0], "在吗")
+
+    def test_suspicious_chars_are_named(self):
+        self.assertEqual(
+            core.suspicious_chars("/addkey\u3000Cline01 sk_x"),
+            ["全角空格 U+3000"],
+        )
+        self.assertEqual(core.suspicious_chars("／addkey"), ["全角斜杠 U+FF0F"])
+        self.assertEqual(core.suspicious_chars("/addkey Cline01 sk_x"), [])
+
+    def test_suspicious_chars_are_deduplicated(self):
+        self.assertEqual(core.suspicious_chars("/a\u200b\u200bb"), ["零宽空格 U+200B"])
+
+    def test_normalize_does_not_touch_the_key(self):
+        text = core.normalize_command_text("／addkey\u3000Cline-01 sk_05b0abcdef123456")
+        self.assertIn("sk_05b0abcdef123456", text)
+
+
 # ==================== API Key 清洗 ====================
 class TestNormalizeApiKey(unittest.TestCase):
     def test_long_key_is_fine(self):

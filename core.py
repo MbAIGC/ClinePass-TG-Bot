@@ -28,7 +28,7 @@ import requests
 log = logging.getLogger("clinepass.core")
 
 # 版本号（单一来源：bot 启动日志、/help、面板标题都取这里）
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 
 #: 日志里必须抹掉的两个东西：Telegram Bot Token（藏在 httpx 的 URL 里、也藏在
 #: PTB 异常消息里）和 ClinePass API Key
@@ -445,6 +445,87 @@ def normalize_api_key(raw: str) -> tuple[str, bool]:
     cleaned = "".join(c for c in cleaned if c.isprintable())
     cleaned = cleaned.strip()
     return cleaned, cleaned != text
+
+
+#: 各种"像空格但不是空格"的字符：换成普通空格（全角空格最常见，来自中文输入法）
+_SPACE_LIKE_CHARS = (
+    "\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008"
+    "\u2009\u200a\u202f\u205f\u3000"
+)
+
+#: 常被人拿来包裹命令的符号（代码块、各种引号）
+_COMMAND_WRAPPERS = "`'\"“”‘’"
+
+
+def normalize_command_text(text: str, invisible: str = "delete") -> str:
+    """把「看起来是命令、实际却不是」的文本修回可解析的样子。
+
+    真实踩过的坑：
+    - 中文输入法打出的全角空格（U+3000）：Telegram 不认，命令实体还会把别名一起吞进去
+    - 全角斜杠 `／addkey`：Telegram 压根不当命令
+    - 从网页/消息复制时带进来的零宽字符（U+200B、BOM）
+    - 被包成代码块或引号：`` `/addkey ...` ``
+
+    `invisible="delete"` 把零宽字符直接删掉（`/add\u200bkey` → `/addkey`），
+    `invisible="space"` 把它当分隔符（`/addkey\u200bCline01` → `/addkey Cline01`）——
+    两种都有可能，所以 :func:`parse_command_candidates` 会都算一遍。
+    """
+    out = (text or "").strip()
+    while out and out[:1] in _COMMAND_WRAPPERS:
+        out = out[1:].lstrip()
+    while out and out[-1:] in _COMMAND_WRAPPERS:
+        out = out[:-1].rstrip()
+    for ch in _SPACE_LIKE_CHARS:
+        out = out.replace(ch, " ")
+    for ch in _INVISIBLE_CHARS:
+        out = out.replace(ch, " " if invisible == "space" else "")
+    if out[:1] in ("／", "＼"):
+        out = "/" + out[1:]
+    return out.strip()
+
+
+def parse_command_tokens(text: str, invisible: str = "delete") -> tuple[str, list[str]]:
+    """从（可能被修过的）文本里取出 (命令名, 参数)；命令名不含斜杠与 @bot。"""
+    tokens = normalize_command_text(text, invisible).split()
+    if not tokens:
+        return "", []
+    head = tokens[0]
+    if head[:1] in ("/", "／", "＼"):
+        head = head[1:]
+    return head.split("@", 1)[0].lower(), tokens[1:]
+
+
+#: 可疑字符的中文说明，用于给用户一个"看得见"的解释
+_SUSPICIOUS_NAMES = {
+    "\u3000": "全角空格 U+3000",
+    "\u00a0": "不换行空格 U+00A0",
+    "\u200b": "零宽空格 U+200B",
+    "\u200c": "零宽不连字 U+200C",
+    "\u200d": "零宽连字 U+200D",
+    "\u2060": "词连接符 U+2060",
+    "\ufeff": "BOM U+FEFF",
+    "／": "全角斜杠 U+FF0F",
+    "＼": "全角反斜杠 U+FF3C",
+}
+
+
+def suspicious_chars(text: str) -> list[str]:
+    """列出文本里那些"肉眼看不见但会让命令失效"的字符（去重，按出现顺序）。"""
+    found: list[str] = []
+    for ch in text or "":
+        label = _SUSPICIOUS_NAMES.get(ch)
+        if label is None and ord(ch) > 127 and not ch.isprintable():
+            label = f"U+{ord(ch):04X}"
+        if label and label not in found:
+            found.append(label)
+    return found
+
+
+def parse_command_candidates(text: str) -> list[tuple[str, list[str]]]:
+    """把两种零宽字符处理方式都算一遍，按可信度排序，供兜底救援逐个尝试。"""
+    first = parse_command_tokens(text, "delete")
+    second = parse_command_tokens(text, "space")
+    return [first] if first == second else [first, second]
 
 
 def split_alias_and_key(args: Sequence[str]) -> tuple[Optional[str], str]:

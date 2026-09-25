@@ -40,10 +40,13 @@ from core import (
     esc,
     mask_key,
     normalize_api_key,
+    parse_command_candidates,
+    parse_command_tokens,
     redact,
     render_panel,
     split_alias_and_key,
     split_message,
+    suspicious_chars,
 )
 
 log = logging.getLogger("clinepass.bot")
@@ -448,28 +451,80 @@ async def log_incoming(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """看起来像指令却没被任何 handler 认领 —— 必须给反馈，不能静默。
+class _ArgsOverride:
+    """只替换 context.args，其余属性继续转发给真实的 PTB context。"""
 
-    最常见的是全角斜杠：`／addkey` 在 Telegram 眼里只是普通消息，不会触发命令，
-    用户看到的就是"毫无反馈"。
+    def __init__(self, context: ContextTypes.DEFAULT_TYPE, args: list[str]):
+        self._context = context
+        self.args = args
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._context, name)
+
+
+#: 兜底救援表：Telegram 没把它当命令、但我们认得出来的指令
+_RESCUE_HANDLERS = {
+    "start": start_command,
+    "help": help_command,
+    "id": id_command,
+    "status": status_command,
+    "quota": status_command,
+    "addkey": addkey_command,
+    "delkey": delkey_command,
+    "keys": keys_command,
+    "clear": clear_command,
+}
+
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """看起来像指令却没被任何 handler 认领 —— 先尝试救回来，救不了再给反馈。
+
+    PTB 的 CommandHandler 认的是 Telegram 给的 `bot_command` 实体，所以这些情况
+    它都会漏掉，用户看到的就是"毫无反应"：全角斜杠 `／addkey`、全角空格、
+    复制粘贴带进来的零宽字符、把命令包进代码块。这些在这里统一兜住。
     """
     message = update.effective_message
     if message is None or update.effective_chat is None:
         return
-    text = (message.text or "").strip()
+    text = message.text or ""
+
+    name, _ = parse_command_tokens(text)
+    for candidate, candidate_args in parse_command_candidates(text):
+        handler = _RESCUE_HANDLERS.get(candidate)
+        if handler is not None:
+            log.info(
+                "兜底识别出指令：/ %s（原始首字符=%r，长度=%d），交给 %s 处理",
+                candidate,
+                text[:1],
+                len(text),
+                handler.__name__,
+            )
+            await handler(update, _ArgsOverride(context, candidate_args))  # type: ignore[arg-type]
+            return
+
     log.warning(
-        "没能识别的指令：chat=%s user=%s 首字符=%r 长度=%d",
+        "没能识别的指令：chat=%s user=%s 首字符=%r 长度=%d 命令名=%r",
         update.effective_chat.id,
         update.effective_user.id if update.effective_user else "-",
         text[:1],
         len(text),
+        name,
     )
-    hint = ""
+    reasons: list[str] = []
     if text[:1] in ("／", "＼"):
-        hint = "看起来斜杠打成了全角 <code>／</code>，Telegram 只认英文 <code>/</code>。\n"
+        reasons.append("斜杠打成了全角 <code>／</code>，请用英文 <code>/</code>。")
+        rest = text[1:]
+    else:
+        rest = text
+    suspicious = suspicious_chars(rest)
+    if suspicious:
+        reasons.append("检测到看不见的字符：" + "、".join(esc(x) for x in suspicious) + "，建议删掉重打一遍。")
+    if text.strip()[:1] in ("`", "'", '"', "“", "”", "‘", "’"):
+        reasons.append("命令被代码块或引号包住了，去掉外层符号再发一次。")
     await message.reply_text(
-        "🤔 没识别出这个指令。\n" + hint + "常用：<code>/status</code>、<code>/addkey</code>、<code>/help</code>",
+        "🤔 没识别出这个指令。\n"
+        + "".join(f"{line}\n" for line in reasons)
+        + "常用：<code>/status</code>、<code>/addkey</code>、<code>/help</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -506,9 +561,12 @@ def build_application(settings: Settings, token: str) -> Application:
     application.add_handler(CommandHandler("clear", clear_command))
 
     # 同一个 group 里注册在最后：只有前面没有任何 CommandHandler 认领时才会轮到它，
-    # 于是「全角斜杠」「指令名打错」这类沉默都会变成一句明确的回复。
+    # 于是「全角斜杠」「全角空格」「零宽字符」「被包进代码块」这些坑都能被兜住或给出反馈。
     application.add_handler(
-        MessageHandler(filters.TEXT & filters.Regex(r"^\s*[/／]"), unknown_command)
+        MessageHandler(
+            filters.TEXT & filters.Regex(r"^\s*[`'\"“”‘’]*\s*[/／]"),
+            unknown_command,
+        )
     )
     application.add_error_handler(on_error)
     return application

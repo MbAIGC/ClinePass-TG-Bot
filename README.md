@@ -1,6 +1,6 @@
 # 🤖 ClinePass TG Bot
 
-> 当前版本 **0.0.5**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
+> 当前版本 **0.0.6**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
 
 把 Cline / ClinePass 账号的用量做成 Telegram 面板：一个用户可绑定多个 API Key，`/status` 一次看全部账号。
 
@@ -84,6 +84,10 @@ python bot.py
 > **Key 没有长度上限**：`sk_` + 59 位、上百位都正常，只要求 ≥ 8 个字符且不含空格。
 > 从网页复制时容易夹带零宽字符（U+200B 之类）——肉眼一样但服务端只会回 401，
 > Bot 会自动清理，并在回复里加一句「已自动去掉不可见的字符」。
+>
+> **命令写歪了也能用**：全角斜杠 `／addkey`、中文输入法打出的全角空格、
+> 复制带进来的零宽字符、被 ```或引号包住的命令，Bot 都会先修好再执行（0.0.6+）；
+> 实在救不回来时，回复里会明确指出是哪个字符在捣乱。
 
 ## 指令一览
 
@@ -220,7 +224,7 @@ Authorization: Bearer sk_xxx
 ├── .github/workflows/ci.yml  # CI：单测矩阵 → 构建镜像+冒烟 → 打标签时推 GHCR
 ├── bot.py                # Telegram 交互层：指令、鉴权、限流、错误兜底
 ├── core.py               # 核心逻辑：JSON 存储、API 客户端、面板渲染（无 PTB 依赖，可单测）
-├── tests/test_core.py    # 72 个单元测试，纯标准库
+├── tests/test_core.py    # 85 个单元测试，纯标准库
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -244,7 +248,7 @@ python3 -m unittest discover -s tests -t . -v
 
 | job | 内容 |
 | --- | --- |
-| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 72 个单元测试 |
+| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 85 个单元测试 |
 | `docker` | buildx 构建镜像（带 gha 缓存）→ 镜像内自检：能导入、非 root(10001)、命名卷可写配置、缺 Token 时退出码为 1 |
 | `publish` | 仅在 `main` 分支或 `v*` 标签上触发，推送到 GHCR（`ghcr.io/mbaigc/clinepass-tg-bot`） |
 
@@ -297,7 +301,8 @@ docker run -d --name clinepass_tg_bot --restart unless-stopped \
 | `❌ 配置存储不可用 … 权限不足`（0.0.2 起的不崩版本） | 同上，日志里的提示就是修复命令 |
 | `❌ 配置存储不可用 … 是一个目录` | 宿主机上把不存在的 `config.json` **文件**挂进了容器；改成挂载目录 |
 | `/addkey` 后 `/status` 仍说没有 Key | 先发 `/id`（0.0.4+）看存储是否可写；多半是「文件可读、目录不可写」，见下方排查 |
-| 发指令完全没反应 | 先看日志有没有 `收到更新：…`；没有就是更新没到 Bot（全角斜杠 `／`、群组隐私模式、另一个实例抢 updates） |
+| 发指令完全没反应 | 先看日志有没有 `收到更新：…`；没有就是更新没到 Bot（群组隐私模式、另一个实例抢 updates） |
+| 明明发的是 `/addkey` 却回「没识别出这个指令」 | 命令里混了全角空格 / 零宽字符，或被包进了代码块或引号。0.0.6 起会自动纠正后照常执行（日志里有一行「兜底识别出指令」），救不回来时会明确指出是哪个字符 |
 | 日志里出现 `bot<TOKEN>` / `sk_<KEY>` | 这是脱敏后的样子，属正常；真 Token 不会进日志 |
 | `📊 额度接口不可用：接口不存在（404）` | 默认路径已对准官方接口；若你改过 `CLINEPASS_USAGE_PATH`，检查拼写 |
 | `📊 额度接口不可用：API Key 无效（401）` | 该 Key 已失效，重新 `/addkey` |
@@ -372,6 +377,7 @@ docker compose logs --tail 100 | grep -iE "addkey|permission|traceback|conflict"
 
 | 版本 | 说明 |
 | --- | --- |
+| **0.0.6** | 命令兜底救援：Telegram 只把「标准命令」交给我们，全角斜杠 `／addkey`、全角空格、零宽字符、被代码块包住的命令都会漏掉。现在这些文本会被自动修好并交给对应处理器执行；救不回来时回复里点名「全角空格 U+3000」这类元凶 |
 | **0.0.5** | 日志改造：所有输出走兜底脱敏（Token → `bot<TOKEN>`、Key → `sk_<KEY>`，连 traceback 与 `sys.excepthook` 都覆盖），httpx 噪音降到 WARNING；新增 group -1 的「收到更新」日志（只记命令名，不记正文）；全角斜杠/打错指令名会明确回一句而不是沉默；API Key 自动清理零宽字符 |
 | **0.0.4** | 加诊断：`/id` 显示版本/容器名/配置文件/存储可写性/已绑定数量；启动时做写入探针；`/addkey`、`/delkey`、`/clear` 每次都有 INFO 日志（Key 绝不入日志）；未捕获异常会回一条带异常名的提示 |
 | **0.0.3** | `/addkey` 约定「最后一个参数是 Key，其余拼成别名」，带空格的别名（`Codex 备用`）不再是坑；别名规则与报错文案写清楚（`Cline-01` 一直合法） |
