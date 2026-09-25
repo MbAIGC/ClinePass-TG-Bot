@@ -28,7 +28,7 @@ import requests
 log = logging.getLogger("clinepass.core")
 
 # 版本号（单一来源：bot 启动日志、/help、面板标题都取这里）
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 # ==================== 常量 ====================
 DEFAULT_API_BASE = "https://api.cline.bot"
@@ -84,6 +84,14 @@ ALIAS_RE = re.compile(r"^[\w\u4e00-\u9fff][\w\u4e00-\u9fff .\-]{0,23}$")
 # ==================== 配置 ====================
 class ConfigError(RuntimeError):
     """配置存储不可用（权限、路径是目录等），必须让用户看见，不能静默吞掉。"""
+
+
+#: 容器里以非 root 运行，挂载目录属主不对时给出可照抄的修复步骤
+PERMISSION_HINT = (
+    "容器内以非 root 运行（uid 10001，用户 app），挂载目录的属主必须交给它："
+    "在宿主机执行 sudo chown -R 10001:10001 <你的数据目录>，"
+    "或改用 docker-compose.yml 默认的命名卷（-v clinepass-data:/app/data）。"
+)
 
 
 class KeyLimitError(RuntimeError):
@@ -211,6 +219,8 @@ class ConfigStore:
         if parent and not os.path.isdir(parent):
             try:
                 os.makedirs(parent, exist_ok=True)
+            except PermissionError as exc:
+                raise ConfigError(f"无法创建配置目录 {parent}：权限不足。{PERMISSION_HINT}\n（原始错误：{exc}）") from exc
             except OSError as exc:
                 raise ConfigError(f"无法创建配置目录 {parent}：{exc}") from exc
 
@@ -246,23 +256,38 @@ class ConfigStore:
         return data
 
     def save(self, data: dict) -> None:
-        """原子写入 + 收紧权限（Key 是敏感信息）。"""
+        """原子写入 + 收紧权限（Key 是敏感信息）。
+
+        mkstemp 也必须包在 try 里：目录不可写时它抛的是 PermissionError，
+        漏出去会让进程直接崩在启动阶段（见 v0.0.1 的线上报错）。
+        """
         self._check_path()
         parent = os.path.dirname(os.path.abspath(self.path)) or "."
-        fd, tmp_path = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=parent)
+        tmp_path = ""
         try:
+            fd, tmp_path = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=parent)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, ensure_ascii=False, indent=2)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.chmod(tmp_path, 0o600)
             os.replace(tmp_path, self.path)
+        except PermissionError as exc:
+            self._discard(tmp_path)
+            raise ConfigError(f"无法写入配置 {self.path}：权限不足。{PERMISSION_HINT}\n（原始错误：{exc}）") from exc
         except OSError as exc:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            self._discard(tmp_path)
             raise ConfigError(f"无法写入配置 {self.path}：{exc}") from exc
+
+    @staticmethod
+    def _discard(tmp_path: str) -> None:
+        """清理写了一半的临时文件；失败也无所谓。"""
+        if not tmp_path:
+            return
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
     # ---- 业务操作 ----
     def keys(self, user_id: int) -> dict[str, str]:

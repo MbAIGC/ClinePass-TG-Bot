@@ -234,6 +234,45 @@ class TestConfigStore(unittest.TestCase):
         leftovers = [f for f in os.listdir(self.tmp.name) if f.endswith(".tmp")]
         self.assertEqual(leftovers, [])
 
+    def test_permission_error_becomes_config_error(self):
+        """线上 v0.0.1 的坑：目录不可写时 mkstemp 抛 PermissionError，直接崩进程。"""
+        from unittest import mock
+
+        with mock.patch.object(core.tempfile, "mkstemp", side_effect=PermissionError(13, "Permission denied")):
+            with self.assertRaises(ConfigError) as cm:
+                self.store.add(1, "a", "sk_123456789")
+        message = str(cm.exception)
+        self.assertIn("权限不足", message)
+        self.assertIn("chown", message)
+
+    def test_write_oserror_becomes_config_error(self):
+        from unittest import mock
+
+        with mock.patch.object(core.tempfile, "mkstemp", side_effect=OSError(28, "No space left on device")):
+            with self.assertRaises(ConfigError):
+                self.store.add(1, "a", "sk_123456789")
+
+    def test_replace_failure_cleans_up_temp_file(self):
+        from unittest import mock
+
+        with mock.patch.object(core.os, "replace", side_effect=OSError(1, "Operation not permitted")):
+            with self.assertRaises(ConfigError):
+                self.store.add(1, "a", "sk_123456789")
+        leftovers = [f for f in os.listdir(self.tmp.name) if f.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+
+    def test_load_never_raises_bare_oserror(self):
+        """ConfigError 之外的 OSError 不应该漏给调用方（否则会崩在启动阶段）。"""
+        from unittest import mock
+
+        with mock.patch.object(core.tempfile, "mkstemp", side_effect=PermissionError(13, "denied")):
+            try:
+                self.store.load()
+            except ConfigError:
+                pass
+            except OSError as exc:  # pragma: no cover - 失败即为回归
+                self.fail(f"应当转成 ConfigError，实际漏出 {exc!r}")
+
 
 # ==================== 额度解析 ====================
 class TestParseUsage(unittest.TestCase):

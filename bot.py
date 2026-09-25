@@ -356,6 +356,8 @@ def main() -> int:
         log.info("配置存储就绪：%s", settings.config_file)
     except ConfigError as exc:
         log.critical("配置存储不可用：%s", exc)
+    except OSError as exc:  # 兜底：宁可降级运行，也不要崩成 restart 循环
+        log.critical("配置存储初始化失败：%s", exc)
 
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     if not token or token == "YOUR_TELEGRAM_BOT_TOKEN":

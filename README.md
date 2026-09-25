@@ -1,6 +1,6 @@
 # 🤖 ClinePass TG Bot
 
-> 当前版本 **0.0.1**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
+> 当前版本 **0.0.2**（代码里的 `core.__version__` 是唯一来源，标签发布见「持续集成与发布」）
 
 把 Cline / ClinePass 账号的用量做成 Telegram 面板：一个用户可绑定多个 API Key，`/status` 一次看全部账号。
 
@@ -204,7 +204,7 @@ Authorization: Bearer sk_xxx
 ├── .github/workflows/ci.yml  # CI：单测矩阵 → 构建镜像+冒烟 → 打标签时推 GHCR
 ├── bot.py                # Telegram 交互层：指令、鉴权、限流、错误兜底
 ├── core.py               # 核心逻辑：JSON 存储、API 客户端、面板渲染（无 PTB 依赖，可单测）
-├── tests/test_core.py    # 45 个单元测试，纯标准库
+├── tests/test_core.py    # 49 个单元测试，纯标准库
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -220,7 +220,7 @@ Authorization: Bearer sk_xxx
 python3 -m unittest discover -s tests -t . -v
 ```
 
-覆盖范围：进度条边界、别名校验、消息分片（含超长单行硬切）、冷却器、配置读写/上限/权限/损坏恢复/目录异常、官方额度接口解析（`five_hour`/`weekly`/`monthly`、未知类型、非法值、空列表）、纳秒时间戳解析、重置倒计时、80%/95% 告警、版本号、客户端的成功、401、404、503 重试、网络异常、非 JSON 响应、DEMO 模式、HTML 转义与长面板分片。
+覆盖范围：进度条边界、别名校验、消息分片（含超长单行硬切）、冷却器、配置读写/上限/权限/损坏恢复/目录异常/写入失败转 ConfigError、官方额度接口解析（`five_hour`/`weekly`/`monthly`、未知类型、非法值、空列表）、纳秒时间戳解析、重置倒计时、80%/95% 告警、版本号、客户端的成功、401、404、503 重试、网络异常、非 JSON 响应、DEMO 模式、HTML 转义与长面板分片。
 
 ## 持续集成与发布
 
@@ -228,7 +228,7 @@ python3 -m unittest discover -s tests -t . -v
 
 | job | 内容 |
 | --- | --- |
-| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 45 个单元测试 |
+| `test` | Python 3.10 / 3.11 / 3.12 矩阵：装依赖 → `compileall` 编译检查 → 49 个单元测试 |
 | `docker` | buildx 构建镜像（带 gha 缓存）→ 镜像内自检：能导入、非 root(10001)、命名卷可写配置、缺 Token 时退出码为 1 |
 | `publish` | 仅在 `main` 分支或 `v*` 标签上触发，推送到 GHCR（`ghcr.io/mbaigc/clinepass-tg-bot`） |
 
@@ -242,40 +242,62 @@ vim core.py && git commit -am "release: 0.0.2" && git push
 git tag v0.0.2 && git push origin v0.0.2
 ```
 
-镜像标签规则：`v0.0.1` → `0.0.1`、`0.0`；`main` 分支 → `main` 与 `latest`。镜像公开后可以直接部署：
+镜像标签规则：`v0.0.2` → `0.0.2`、`0.0`；`main` 分支 → `main` 与 `latest`。镜像公开后可以直接部署：
 
 ```bash
 docker run -d --name clinepass_tg_bot --restart unless-stopped \
   -e TELEGRAM_BOT_TOKEN=xxx \
   -v clinepass-data:/app/data \
-  ghcr.io/mbaigc/clinepass-tg-bot:0.0.1
+  ghcr.io/mbaigc/clinepass-tg-bot:0.0.2
 ```
+
+> 上面用的是**命名卷**，Docker 会把镜像里 `/app/data` 的属主（uid 10001）带过来，开箱可写。
+> 如果你改成挂载宿主机目录（`-v ./data:/app/data`），必须先把目录交给 uid 10001，否则会报权限错误——见「故障排查」。
 
 ## 故障排查
 
 | 现象 | 原因与处理 |
 | --- | --- |
 | 启动即退出，日志 `未配置 TELEGRAM_BOT_TOKEN` | 没读到 Token；本地检查 `export`，容器检查 `.env` |
-| `❌ 配置存储不可用 … 是一个目录` | 宿主机上把不存在的 `config.json` 文件挂进了容器；改用挂载目录（见下） |
-| `❌ 保存失败，Key 没有被记录` | 挂载目录属主不对，容器内 uid 10001 无写权限 |
+| `PermissionError: … /app/data/.config-*.tmp`（0.0.1 会直接崩） | 挂载目录属主不是 uid 10001，见下方「挂载与权限」 |
+| `❌ 配置存储不可用 … 权限不足`（0.0.2 起的不崩版本） | 同上，日志里的提示就是修复命令 |
+| `❌ 配置存储不可用 … 是一个目录` | 宿主机上把不存在的 `config.json` **文件**挂进了容器；改成挂载目录 |
 | `📊 额度接口不可用：接口不存在（404）` | 默认路径已对准官方接口；若你改过 `CLINEPASS_USAGE_PATH`，检查拼写 |
 | `📊 额度接口不可用：API Key 无效（401）` | 该 Key 已失效，重新 `/addkey` |
-| `🔒 API Key 无效或已过期（401）` | 该 Key 无效/过期，重新 `/addkey` |
 | 面板只发出了一部分 | 已按 `MESSAGE_LIMIT` 自动分片，属正常 |
 | `⏳ 操作太快了` | `STATUS_COOLDOWN` 限流，稍等即可 |
 
-**用宿主机目录保存配置**（方便直接查看 `config.json`）：
+### 挂载与权限
+
+容器**以非 root（uid 10001，用户 `app`）运行**，所以挂载进去的目录必须由它拥有。两种情况：
+
+**1）挂载宿主机目录（`-v ./data:/app/data`）**
 
 ```bash
-mkdir -p ./data && sudo chown 10001:10001 ./data
-# 然后编辑 docker-compose.yml，把命名卷换成： - ./data:/app/data
+mkdir -p ./data
+sudo chown -R 10001:10001 ./data      # 关键一步
+docker compose up -d
 ```
 
-**用命名卷时怎么看配置**：
+**2）命名卷被更早的 root 版容器写过**
+
+如果你之前用过旧版（以 root 运行）并复用了同一个卷，卷里的文件属主是 root，同样写不进去。用镜像自带的 `chown` 修一下即可：
 
 ```bash
+docker compose down
+docker run --rm --user root -v clinepass-data:/app/data \
+  ghcr.io/mbaigc/clinepass-tg-bot:0.0.2 chown -R 10001:10001 /app/data
+docker compose up -d
+```
+
+（卷名以 `docker volume ls` 看到的为准，compose 项目通常会加 `项目名_` 前缀。）
+
+**3）确认结果**
+
+```bash
+docker compose exec clinepass-bot ls -ln /app/data     # 应为 10001 10001
 docker compose exec clinepass-bot cat /app/data/config.json
-docker compose cp clinepass-bot:/app/data/config.json ./config.json.bak
+docker compose cp clinepass-bot:/app/data/config.json ./config.json.bak   # 备份出来
 ```
 
 ## 与旧版本的差异
@@ -286,6 +308,13 @@ docker compose cp clinepass-bot:/app/data/config.json ./config.json.bak
 - `config.json` 由 `bot.py` 同级改为可配置，容器内落进数据卷
 - 新增 `core.py`、单元测试、`.env.example`、`.gitignore`、`.dockerignore`
 - Markdown → HTML 渲染，别名里带 `_`、`*`、`<` 等字符不再导致发送失败
+
+## 版本历史
+
+| 版本 | 说明 |
+| --- | --- |
+| **0.0.2** | 修复：挂载目录不可写时 `tempfile.mkstemp` 抛出的 `PermissionError` 会漏出，导致进程崩在启动阶段；现在统一转成带修复指引的 `ConfigError`，Bot 降级运行并在日志/聊天里说明原因 |
+| 0.0.1 | 首个版本：官方额度接口、多 Key 面板、Docker 镜像与 GHCR 发布 |
 
 ## 许可
 
